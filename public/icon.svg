@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="Come Again icon">
+  <rect width="100" height="100" rx="22" fill="#133f46" />
+  <path
+    d="M50 18c8 0 14 6 14 14v21c0 8-6 14-14 14s-14-6-14-14V32c0-8 6-14 14-14Zm25 31a3 3 0 0 1 3 3c0 14-10 26-24 28v8h10a3 3 0 1 1 0 6H36a3 3 0 1 1 0-6h10v-8c-14-2-24-14-24-28a3 3 0 1 1 6 0c0 12 10 22 22 22s22-10 22-22a3 3 0 0 1 3-3Z"
+    fill="#f5f1e8"
+  />
+</svg>
