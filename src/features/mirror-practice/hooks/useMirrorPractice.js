@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import useIntervalTicker from "../../../shared/hooks/useIntervalTicker";
 import {
+  createConfiguredRecognition,
   FATAL_RECOGNITION_ERRORS,
   formatTime,
   getSpeechRecognitionClass,
   NON_BLOCKING_RECOGNITION_ERRORS,
 } from "../../../shared/speechRecognition";
+import { appendCaptionText, buildCaptionLines } from "../utils/captionLines";
+import { AUDIO_FRAME_INTERVAL_MS, computeTakeMetrics, measureAudioFrame } from "../utils/takeMetrics";
+import { findLatestTakeForLanguage, loadTakeHistory, saveTakeToHistory } from "../utils/takeHistory";
 
 const DEFAULT_CAPTION_TEXT = "Your live transcript appears here whilst you speak.";
 const PREFERRED_VIDEO_MIME_TYPES = [
@@ -18,9 +23,6 @@ const DEFAULT_VIDEO_HEIGHT = 720;
 const COMPOSED_FRAME_RATE = 30;
 const FINAL_SUBTITLE_HOLD_MS = 5200;
 const INTERIM_SUBTITLE_THROTTLE_MS = 600;
-const SUBTITLE_MAX_WORDS = 14;
-const SUBTITLE_MAX_CHARS = 96;
-const SUBTITLE_MAX_UNBROKEN_CHARS = 42;
 
 function isDesktopChromeOrEdgeBrowser() {
   if (typeof navigator === "undefined") {
@@ -122,68 +124,6 @@ function getCanvasDimensions(stream) {
   };
 }
 
-function normalizeSubtitleText(text) {
-  return text.trim().replace(/\s+/g, " ");
-}
-
-function getYouTubeStyleSubtitleText(text) {
-  const normalizedText = normalizeSubtitleText(text);
-
-  if (!normalizedText) {
-    return "";
-  }
-
-  const words = normalizedText.split(" ");
-
-  if (words.length === 1) {
-    return normalizedText.slice(-SUBTITLE_MAX_UNBROKEN_CHARS);
-  }
-
-  let subtitleWords = words.slice(-SUBTITLE_MAX_WORDS);
-
-  while (subtitleWords.join(" ").length > SUBTITLE_MAX_CHARS && subtitleWords.length > 1) {
-    subtitleWords = subtitleWords.slice(1);
-  }
-
-  return subtitleWords.join(" ");
-}
-
-function wrapSubtitleLines(context, text, maxWidth) {
-  const words = getYouTubeStyleSubtitleText(text).split(/\s+/).filter(Boolean);
-
-  if (!words.length) {
-    return [];
-  }
-
-  const lines = [];
-  let currentLine = words[0];
-
-  for (let index = 1; index < words.length; index += 1) {
-    const nextLine = `${currentLine} ${words[index]}`;
-
-    if (context.measureText(nextLine).width <= maxWidth) {
-      currentLine = nextLine;
-      continue;
-    }
-
-    lines.push(currentLine);
-
-    currentLine = words[index];
-
-    if (lines.length < 2) {
-      continue;
-    }
-
-    break;
-  }
-
-  if (lines.length < 2 && currentLine) {
-    lines.push(currentLine);
-  }
-
-  return lines.slice(0, 2);
-}
-
 function drawRoundedRect(context, x, y, width, height, radius) {
   context.beginPath();
   context.moveTo(x + radius, y);
@@ -239,7 +179,10 @@ export default function useMirrorPractice(defaultLanguage) {
       return "Video recording is unavailable in this browser.";
     }
 
-    if (typeof HTMLCanvasElement !== "undefined" && typeof HTMLCanvasElement.prototype.captureStream !== "function") {
+    if (
+      typeof HTMLCanvasElement !== "undefined" &&
+      typeof HTMLCanvasElement.prototype.captureStream !== "function"
+    ) {
       return "This browser cannot embed captions in the recorded clip.";
     }
 
@@ -247,7 +190,10 @@ export default function useMirrorPractice(defaultLanguage) {
   }, [isSupportedDesktopBrowser, isSupported, recognitionClass]);
 
   const [selectedLanguage, setSelectedLanguage] = useState(defaultLanguage);
-  const [captionText, setCaptionText] = useState(DEFAULT_CAPTION_TEXT);
+  const [captionLines, setCaptionLines] = useState([DEFAULT_CAPTION_TEXT]);
+  // Matches the stage <video> elements to the real camera frame so nothing is
+  // cropped and the burned-in captions replay exactly where the live ones were.
+  const [stageAspectRatio, setStageAspectRatio] = useState(DEFAULT_VIDEO_WIDTH / DEFAULT_VIDEO_HEIGHT);
   const [isRecording, setIsRecording] = useState(false);
   const [elapsedTime, setElapsedTime] = useState("00:00");
   const [errorMessage, setErrorMessage] = useState("");
@@ -255,7 +201,9 @@ export default function useMirrorPractice(defaultLanguage) {
   const [hasCompletedTake, setHasCompletedTake] = useState(false);
   const [recordingUrl, setRecordingUrl] = useState("");
   const [downloadFileName, setDownloadFileName] = useState("");
-  const [transcriptText, setTranscriptText] = useState("");
+  const [transcriptEntries, setTranscriptEntries] = useState([]);
+  const [takeMetrics, setTakeMetrics] = useState(null);
+  const [previousTakeMetrics, setPreviousTakeMetrics] = useState(null);
 
   const previewVideoRef = useRef(null);
   const recognitionRef = useRef(null);
@@ -268,7 +216,6 @@ export default function useMirrorPractice(defaultLanguage) {
   const recordingMimeTypeRef = useRef("");
   const currentRecordingUrlRef = useRef("");
   const restartTimeoutRef = useRef(null);
-  const elapsedTimerRef = useRef(null);
   const renderFrameIdRef = useRef(0);
   const subtitleClearTimeoutRef = useRef(null);
   const interimSubtitleFlushTimeoutRef = useRef(null);
@@ -278,8 +225,27 @@ export default function useMirrorPractice(defaultLanguage) {
   const interimSubtitleRef = useRef("");
   const pendingInterimSubtitleRef = useRef("");
   const lastInterimSubtitlePaintAtRef = useRef(0);
-  const finalSubtitleRef = useRef("");
-  const finalSubtitleExpiresAtRef = useRef(0);
+  // Rolling caption source: recent recognised text with committed line breaks
+  // ("\n"). Trimmed to the visible lines after every final result so it never
+  // grows unbounded and already-shown words never re-wrap.
+  const captionBufferRef = useRef("");
+  // Mirror of the captionLines state for the canvas render loop.
+  const captionLinesRef = useRef([]);
+  // Mirror of the transcriptEntries state so stopSession can compute take
+  // metrics synchronously without waiting for a state flush.
+  const transcriptEntriesRef = useRef([]);
+  // Live audio analysis: { audioContext, sourceNode, intervalId }.
+  const audioAnalysisRef = useRef(null);
+  // One { rms, pitchHz } sample per AUDIO_FRAME_INTERVAL_MS across the take.
+  const audioFramesRef = useRef([]);
+  // The language recognition was started with. Metrics and history must use
+  // this rather than selectedLanguage: the select stays enabled until
+  // isRecording flips, and depending on selectedLanguage in stopSession would
+  // recreate the recognition effect mid-start and abort the session.
+  const sessionLanguageRef = useRef(defaultLanguage);
+  // Set by the error paths that end a take (recorder failure, fatal
+  // recognition error) so stopSession skips saving a broken take to history.
+  const sessionFailedRef = useRef(false);
 
   const attachPreviewStream = useCallback((stream) => {
     const video = previewVideoRef.current;
@@ -338,63 +304,80 @@ export default function useMirrorPractice(defaultLanguage) {
     }
   }, []);
 
-  const commitInterimSubtitle = useCallback((subtitleText) => {
-    clearInterimSubtitleFlushTimer();
-    pendingInterimSubtitleRef.current = "";
-    interimSubtitleRef.current = subtitleText;
-    lastInterimSubtitlePaintAtRef.current = subtitleText ? Date.now() : 0;
-    setCaptionText(subtitleText);
-  }, [clearInterimSubtitleFlushTimer]);
+  const applyCaptionLines = useCallback((lines) => {
+    captionLinesRef.current = lines;
+    setCaptionLines(lines);
+  }, []);
 
-  const showInterimSubtitle = useCallback((subtitleText) => {
-    clearSubtitleHideTimer();
+  const commitInterimSubtitle = useCallback(
+    (subtitleText) => {
+      clearInterimSubtitleFlushTimer();
+      pendingInterimSubtitleRef.current = "";
+      interimSubtitleRef.current = subtitleText;
+      lastInterimSubtitlePaintAtRef.current = subtitleText ? Date.now() : 0;
+      applyCaptionLines(buildCaptionLines(appendCaptionText(captionBufferRef.current, subtitleText)));
+    },
+    [applyCaptionLines, clearInterimSubtitleFlushTimer],
+  );
 
-    if (!subtitleText) {
-      commitInterimSubtitle("");
-      return;
-    }
+  const showInterimSubtitle = useCallback(
+    (subtitleText) => {
+      clearSubtitleHideTimer();
 
-    if (subtitleText === interimSubtitleRef.current || subtitleText === pendingInterimSubtitleRef.current) {
-      return;
-    }
-
-    const elapsedSinceLastPaint = Date.now() - lastInterimSubtitlePaintAtRef.current;
-
-    if (!interimSubtitleRef.current || elapsedSinceLastPaint >= INTERIM_SUBTITLE_THROTTLE_MS) {
-      commitInterimSubtitle(subtitleText);
-      return;
-    }
-
-    pendingInterimSubtitleRef.current = subtitleText;
-
-    if (interimSubtitleFlushTimeoutRef.current) {
-      return;
-    }
-
-    interimSubtitleFlushTimeoutRef.current = window.setTimeout(() => {
-      interimSubtitleFlushTimeoutRef.current = null;
-
-      if (!pendingInterimSubtitleRef.current) {
+      if (!subtitleText) {
+        commitInterimSubtitle("");
         return;
       }
 
-      commitInterimSubtitle(pendingInterimSubtitleRef.current);
-    }, INTERIM_SUBTITLE_THROTTLE_MS - elapsedSinceLastPaint);
-  }, [clearSubtitleHideTimer, commitInterimSubtitle]);
+      if (subtitleText === interimSubtitleRef.current || subtitleText === pendingInterimSubtitleRef.current) {
+        return;
+      }
 
-  const showSubtitleThenHide = useCallback((subtitleText) => {
-    clearSubtitleHideTimer();
-    setCaptionText(subtitleText);
+      const elapsedSinceLastPaint = Date.now() - lastInterimSubtitlePaintAtRef.current;
 
-    if (!subtitleText) {
-      return;
-    }
+      if (!interimSubtitleRef.current || elapsedSinceLastPaint >= INTERIM_SUBTITLE_THROTTLE_MS) {
+        commitInterimSubtitle(subtitleText);
+        return;
+      }
 
-    subtitleClearTimeoutRef.current = window.setTimeout(() => {
-      setCaptionText("");
-      subtitleClearTimeoutRef.current = null;
-    }, FINAL_SUBTITLE_HOLD_MS);
-  }, [clearSubtitleHideTimer]);
+      pendingInterimSubtitleRef.current = subtitleText;
+
+      if (interimSubtitleFlushTimeoutRef.current) {
+        return;
+      }
+
+      interimSubtitleFlushTimeoutRef.current = window.setTimeout(() => {
+        interimSubtitleFlushTimeoutRef.current = null;
+
+        if (!pendingInterimSubtitleRef.current) {
+          return;
+        }
+
+        commitInterimSubtitle(pendingInterimSubtitleRef.current);
+      }, INTERIM_SUBTITLE_THROTTLE_MS - elapsedSinceLastPaint);
+    },
+    [clearSubtitleHideTimer, commitInterimSubtitle],
+  );
+
+  const showSubtitleThenHide = useCallback(
+    (lines) => {
+      clearSubtitleHideTimer();
+      applyCaptionLines(lines);
+
+      if (!lines.length) {
+        return;
+      }
+
+      subtitleClearTimeoutRef.current = window.setTimeout(() => {
+        // After the hold expires the caption disappears; the next utterance
+        // starts a fresh roll-up instead of pulling old words back on screen.
+        captionBufferRef.current = "";
+        applyCaptionLines([]);
+        subtitleClearTimeoutRef.current = null;
+      }, FINAL_SUBTITLE_HOLD_MS);
+    },
+    [applyCaptionLines, clearSubtitleHideTimer],
+  );
 
   const updateElapsed = useCallback(() => {
     if (!sessionStartMsRef.current) {
@@ -406,24 +389,7 @@ export default function useMirrorPractice(defaultLanguage) {
     setElapsedTime(formatTime(elapsedSeconds));
   }, []);
 
-  const startElapsedTimer = useCallback(() => {
-    if (elapsedTimerRef.current) {
-      return;
-    }
-
-    elapsedTimerRef.current = window.setInterval(() => {
-      updateElapsed();
-    }, 500);
-  }, [updateElapsed]);
-
-  const stopElapsedTimer = useCallback(() => {
-    if (elapsedTimerRef.current) {
-      window.clearInterval(elapsedTimerRef.current);
-      elapsedTimerRef.current = null;
-    }
-
-    updateElapsed();
-  }, [updateElapsed]);
+  const { start: startElapsedTimer, stop: stopElapsedTimer } = useIntervalTicker(updateElapsed);
 
   const stopCanvasRenderer = useCallback(() => {
     if (renderFrameIdRef.current) {
@@ -449,7 +415,64 @@ export default function useMirrorPractice(defaultLanguage) {
     recordingCanvasRef.current = null;
   }, [stopCanvasRenderer]);
 
+  const stopAudioAnalysis = useCallback(() => {
+    const analysis = audioAnalysisRef.current;
+
+    if (!analysis) {
+      return;
+    }
+
+    window.clearInterval(analysis.intervalId);
+
+    try {
+      analysis.sourceNode.disconnect();
+    } catch {
+      // The node may already be disconnected if the stream ended first.
+    }
+
+    analysis.audioContext.close().catch(() => undefined);
+    audioAnalysisRef.current = null;
+  }, []);
+
+  // Taps the microphone track for loudness and pitch samples that feed the
+  // post-take delivery metrics. Best-effort: a failure here must never block
+  // the recording itself.
+  const startAudioAnalysis = useCallback(
+    (stream) => {
+      stopAudioAnalysis();
+
+      try {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+
+        if (!AudioContextClass) {
+          return;
+        }
+
+        const audioContext = new AudioContextClass();
+        const sourceNode = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 2048;
+        sourceNode.connect(analyser);
+
+        const sampleBuffer = new Float32Array(analyser.fftSize);
+        const intervalId = window.setInterval(() => {
+          analyser.getFloatTimeDomainData(sampleBuffer);
+          audioFramesRef.current.push(measureAudioFrame(sampleBuffer, audioContext.sampleRate));
+        }, AUDIO_FRAME_INTERVAL_MS);
+
+        audioAnalysisRef.current = { audioContext, sourceNode, intervalId };
+      } catch {
+        audioAnalysisRef.current = null;
+      }
+    },
+    [stopAudioAnalysis],
+  );
+
+  // Analysis samples the microphone track, so it must never outlive the
+  // stream; folding the teardown in here keeps every release path covered.
   const releaseMediaStream = useCallback(() => {
+    stopAudioAnalysis();
+
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       mediaStreamRef.current = null;
@@ -457,7 +480,7 @@ export default function useMirrorPractice(defaultLanguage) {
 
     releaseCompositionResources();
     clearPreviewStream();
-  }, [clearPreviewStream, releaseCompositionResources]);
+  }, [clearPreviewStream, releaseCompositionResources, stopAudioAnalysis]);
 
   const releaseMediaStreamIfRecorderInactive = useCallback(() => {
     if (!mediaRecorderRef.current || mediaRecorderRef.current.state === "inactive") {
@@ -468,91 +491,103 @@ export default function useMirrorPractice(defaultLanguage) {
   const safelyStopRecognition = useCallback(() => {
     try {
       recognitionRef.current?.stop();
-    } catch (error) {
+    } catch {
       // Ignore InvalidStateError when recognition is already stopped.
     }
   }, []);
 
-  const getBurnedSubtitleText = useCallback(() => {
-    const interimSubtitle = interimSubtitleRef.current.trim();
+  const getBurnedSubtitleLines = useCallback(() => captionLinesRef.current, []);
 
-    if (interimSubtitle) {
-      return getYouTubeStyleSubtitleText(interimSubtitle);
-    }
+  const appendTranscriptText = useCallback((textToAppend, confidence) => {
+    const trimmedText = textToAppend?.trim();
 
-    if (finalSubtitleRef.current && Date.now() < finalSubtitleExpiresAtRef.current) {
-      return getYouTubeStyleSubtitleText(finalSubtitleRef.current);
-    }
-
-    return "";
-  }, []);
-
-  const appendTranscriptText = useCallback((textToAppend) => {
-    if (!textToAppend?.trim()) {
+    if (!trimmedText) {
       return;
     }
 
-    setTranscriptText((previousText) => {
-      const needsLeadingSpace = previousText.length > 0 && !previousText.endsWith(" ");
-      return `${previousText}${needsLeadingSpace ? " " : ""}${textToAppend.trim()}`;
-    });
+    const elapsedSeconds = sessionStartMsRef.current
+      ? Math.max(0, Math.floor((Date.now() - sessionStartMsRef.current) / 1000))
+      : 0;
+
+    transcriptEntriesRef.current = [
+      ...transcriptEntriesRef.current,
+      {
+        time: elapsedSeconds,
+        text: trimmedText,
+        confidence: typeof confidence === "number" ? confidence : null,
+      },
+    ];
+    setTranscriptEntries(transcriptEntriesRef.current);
   }, []);
 
   const downloadTranscript = useCallback(() => {
-    const transcript = transcriptText.trim();
-
-    if (!transcript || typeof document === "undefined") {
+    if (!transcriptEntries.length || typeof document === "undefined") {
       return;
     }
 
-    const transcriptBlob = new Blob([`${transcript}\n`], { type: "text/plain;charset=utf-8" });
+    const transcriptLines = transcriptEntries.map((entry) => `[${formatTime(entry.time)}] ${entry.text}`);
+    const transcriptBlob = new Blob([`${transcriptLines.join("\n")}\n`], {
+      type: "text/plain;charset=utf-8",
+    });
     const transcriptUrl = URL.createObjectURL(transcriptBlob);
     const downloadLink = document.createElement("a");
 
     downloadLink.href = transcriptUrl;
-    downloadLink.download = getTranscriptFileName(downloadFileName || getTimestampedRecordingFileName("video/webm"));
+    downloadLink.download = getTranscriptFileName(
+      downloadFileName || getTimestampedRecordingFileName("video/webm"),
+    );
     downloadLink.click();
     URL.revokeObjectURL(transcriptUrl);
-  }, [downloadFileName, transcriptText]);
+  }, [downloadFileName, transcriptEntries]);
 
-  const drawSubtitleFrame = useCallback((context, width, height, subtitleText) => {
-    const safePadding = Math.max(24, width * 0.03);
-    const maxBoxWidth = Math.min(width - safePadding * 2, width * 0.78);
-    const fontSize = Math.max(24, Math.min(34, width * 0.027));
-    const lineHeight = Math.round(fontSize * 1.35);
-    const horizontalPadding = 20;
-
-    context.font = `700 ${fontSize}px Sora, Avenir Next, Segoe UI, sans-serif`;
-    context.textAlign = "left";
-    context.textBaseline = "middle";
-
-    const lines = wrapSubtitleLines(context, subtitleText, maxBoxWidth - horizontalPadding * 2);
-
+  // Per-line caption chips, YouTube style: each line's background hugs its
+  // text and lines are anchored to a fixed left edge so words fill left to
+  // right without anything shifting. All metrics are fractions of the video
+  // width and mirror the cqw-based CSS for .camera-subtitle-overlay, so the
+  // burned-in captions render identically to the live DOM overlay.
+  const drawSubtitleFrame = useCallback((context, width, height, lines) => {
     if (!lines.length) {
       return;
     }
 
+    let fontSize = width * 0.027;
+    const maxTextWidth = width * 0.78 - fontSize * 1.2;
+
+    const applyFont = () => {
+      context.font = `700 ${fontSize}px Sora, Avenir Next, Segoe UI, sans-serif`;
+    };
+
+    context.textAlign = "left";
+    context.textBaseline = "middle";
+    applyFont();
+
+    // Lines are pre-wrapped by character budget; if a line still overflows the
+    // pixel budget (wide glyphs), shrink the font instead of re-wrapping.
     const longestLineWidth = Math.max(...lines.map((line) => context.measureText(line).width));
-    const boxWidth = Math.min(maxBoxWidth, Math.ceil(longestLineWidth + horizontalPadding * 2));
-    const boxHeight = lines.length * lineHeight + 26;
-    const boxX = (width - boxWidth) / 2;
-    const boxY = height - safePadding - boxHeight;
 
-    drawRoundedRect(context, boxX, boxY, boxWidth, boxHeight, 18);
-    context.fillStyle = "rgba(9, 14, 18, 0.72)";
-    context.fill();
-    context.lineWidth = 1;
-    context.strokeStyle = "rgba(255, 255, 255, 0.14)";
-    context.stroke();
+    if (longestLineWidth > maxTextWidth) {
+      fontSize = Math.max(12, fontSize * (maxTextWidth / longestLineWidth));
+      applyFont();
+    }
 
-    context.fillStyle = "#fffaf0";
-    const textCenterY = boxY + boxHeight / 2;
-    const firstLineY = textCenterY - ((lines.length - 1) * lineHeight) / 2;
-    const textX = boxX + horizontalPadding;
+    const paddingX = fontSize * 0.6;
+    const paddingY = fontSize * 0.35;
+    const chipHeight = fontSize * 1.3 + paddingY * 2;
+    const chipRadius = fontSize * 0.35;
+    const leftX = width * 0.11;
+    const totalHeight = lines.length * chipHeight;
+    let chipY = height - width * 0.03 - totalHeight;
 
-    lines.forEach((line, index) => {
-      context.fillText(line, textX, firstLineY + index * lineHeight);
-    });
+    for (const line of lines) {
+      const chipWidth = Math.ceil(context.measureText(line).width + paddingX * 2);
+
+      drawRoundedRect(context, leftX, chipY, chipWidth, chipHeight, chipRadius);
+      context.fillStyle = "rgba(9, 14, 18, 0.74)";
+      context.fill();
+      context.fillStyle = "#fffaf0";
+      context.fillText(line, leftX + paddingX, chipY + chipHeight / 2);
+      chipY += chipHeight;
+    }
   }, []);
 
   const startCanvasRenderer = useCallback(() => {
@@ -578,10 +613,10 @@ export default function useMirrorPractice(defaultLanguage) {
 
       if (sourceVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
         context.drawImage(sourceVideo, 0, 0, canvas.width, canvas.height);
-        const subtitleText = getBurnedSubtitleText();
+        const subtitleLines = getBurnedSubtitleLines();
 
-        if (subtitleText) {
-          drawSubtitleFrame(context, canvas.width, canvas.height, subtitleText);
+        if (subtitleLines.length) {
+          drawSubtitleFrame(context, canvas.width, canvas.height, subtitleLines);
         }
       }
 
@@ -589,9 +624,11 @@ export default function useMirrorPractice(defaultLanguage) {
     };
 
     renderFrameIdRef.current = window.requestAnimationFrame(renderFrame);
-  }, [drawSubtitleFrame, getBurnedSubtitleText]);
+  }, [drawSubtitleFrame, getBurnedSubtitleLines]);
 
   const stopSession = useCallback(() => {
+    const wasActiveTake = isSessionActiveRef.current;
+
     clearRecognitionRestart();
     clearSubtitleHideTimer();
     clearInterimSubtitleFlushTimer();
@@ -599,11 +636,37 @@ export default function useMirrorPractice(defaultLanguage) {
     isSessionActiveRef.current = false;
     setIsRecording(false);
     setHasCompletedTake(true);
-    setCaptionText("");
+    applyCaptionLines([]);
+    captionBufferRef.current = "";
     interimSubtitleRef.current = "";
     pendingInterimSubtitleRef.current = "";
     lastInterimSubtitlePaintAtRef.current = 0;
     safelyStopRecognition();
+    stopAudioAnalysis();
+
+    // Compute and persist metrics once per take, and only for takes the user
+    // ended themselves — error-terminated takes would pollute the
+    // "vs last take" baseline, and a second stopSession call for the same
+    // take (recorder error after a fatal recognition error) must not save a
+    // duplicate history entry.
+    if (wasActiveTake && !sessionFailedRef.current) {
+      const summary = computeTakeMetrics({
+        transcriptEntries: transcriptEntriesRef.current,
+        languageCode: sessionLanguageRef.current,
+        audioFrames: audioFramesRef.current,
+        fallbackDurationSeconds: sessionStartMsRef.current
+          ? (Date.now() - sessionStartMsRef.current) / 1000
+          : 0,
+      });
+
+      if (summary) {
+        const history = loadTakeHistory();
+        setPreviousTakeMetrics(findLatestTakeForLanguage(history, sessionLanguageRef.current));
+        saveTakeToHistory(summary, history);
+      }
+
+      setTakeMetrics(summary);
+    }
 
     if (mediaRecorderRef.current?.state === "recording") {
       mediaRecorderRef.current.stop();
@@ -612,11 +675,13 @@ export default function useMirrorPractice(defaultLanguage) {
     releaseMediaStreamIfRecorderInactive();
     stopElapsedTimer();
   }, [
+    applyCaptionLines,
     clearRecognitionRestart,
     clearInterimSubtitleFlushTimer,
     clearSubtitleHideTimer,
     releaseMediaStreamIfRecorderInactive,
     safelyStopRecognition,
+    stopAudioAnalysis,
     stopElapsedTimer,
   ]);
 
@@ -639,10 +704,14 @@ export default function useMirrorPractice(defaultLanguage) {
     interimSubtitleRef.current = "";
     pendingInterimSubtitleRef.current = "";
     lastInterimSubtitlePaintAtRef.current = 0;
-    finalSubtitleRef.current = "";
-    finalSubtitleExpiresAtRef.current = 0;
-    setTranscriptText("");
-    setCaptionText(DEFAULT_CAPTION_TEXT);
+    captionBufferRef.current = "";
+    captionLinesRef.current = [];
+    transcriptEntriesRef.current = [];
+    audioFramesRef.current = [];
+    setTranscriptEntries([]);
+    setTakeMetrics(null);
+    setPreviousTakeMetrics(null);
+    setCaptionLines([DEFAULT_CAPTION_TEXT]);
     setElapsedTime("00:00");
     setErrorMessage("");
     setHasRecording(false);
@@ -669,17 +738,22 @@ export default function useMirrorPractice(defaultLanguage) {
     clearInterimSubtitleFlushTimer();
     userStoppedRecognitionRef.current = false;
     isSessionActiveRef.current = true;
+    sessionFailedRef.current = false;
+    sessionLanguageRef.current = selectedLanguage;
     sessionStartMsRef.current = Date.now();
     recordedChunksRef.current = [];
     recordingMimeTypeRef.current = "";
     interimSubtitleRef.current = "";
     pendingInterimSubtitleRef.current = "";
     lastInterimSubtitlePaintAtRef.current = 0;
-    finalSubtitleRef.current = "";
-    finalSubtitleExpiresAtRef.current = 0;
-    setTranscriptText("");
+    captionBufferRef.current = "";
+    transcriptEntriesRef.current = [];
+    audioFramesRef.current = [];
+    applyCaptionLines([]);
+    setTranscriptEntries([]);
+    setTakeMetrics(null);
+    setPreviousTakeMetrics(null);
     setErrorMessage("");
-    setCaptionText("");
     setElapsedTime("00:00");
     setHasRecording(false);
     setHasCompletedTake(false);
@@ -705,6 +779,7 @@ export default function useMirrorPractice(defaultLanguage) {
 
       mediaStreamRef.current = stream;
       attachPreviewStream(stream);
+      startAudioAnalysis(stream);
 
       const sourceVideo = document.createElement("video");
       sourceVideo.muted = true;
@@ -714,7 +789,20 @@ export default function useMirrorPractice(defaultLanguage) {
       await sourceVideo.play();
       await waitForVideoReady(sourceVideo);
 
+      if (!isSessionActiveRef.current) {
+        // Stop was pressed while we were waiting on the video element; the
+        // concurrent stopSession() call may have already released
+        // mediaStreamRef, so clean up defensively (both calls are idempotent)
+        // instead of continuing to start recognition/MediaRecorder.
+        sourceVideo.pause();
+        sourceVideo.srcObject = null;
+        stopAudioAnalysis();
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
       const { width, height } = getCanvasDimensions(stream);
+      setStageAspectRatio(width / height);
       const recordingCanvas = document.createElement("canvas");
       recordingCanvas.width = width;
       recordingCanvas.height = height;
@@ -728,10 +816,7 @@ export default function useMirrorPractice(defaultLanguage) {
         throw new Error("microphone-track-unavailable");
       }
 
-      const composedStream = new MediaStream([
-        ...canvasStream.getVideoTracks(),
-        microphoneTrack.clone(),
-      ]);
+      const composedStream = new MediaStream([...canvasStream.getVideoTracks(), microphoneTrack.clone()]);
       composedStreamRef.current = composedStream;
 
       const MediaRecorderClass = window.MediaRecorder;
@@ -747,11 +832,13 @@ export default function useMirrorPractice(defaultLanguage) {
         }
       };
       mediaRecorderRef.current.onerror = () => {
+        sessionFailedRef.current = true;
         setErrorMessage("Video recording failed. Please try again.");
         stopSession();
       };
       mediaRecorderRef.current.onstop = () => {
-        const blobType = recordedChunksRef.current.find((chunk) => chunk.type)?.type ?? recordingMimeTypeRef.current;
+        const blobType =
+          recordedChunksRef.current.find((chunk) => chunk.type)?.type ?? recordingMimeTypeRef.current;
 
         if (!recordedChunksRef.current.length) {
           setHasRecording(false);
@@ -783,7 +870,8 @@ export default function useMirrorPractice(defaultLanguage) {
       isSessionActiveRef.current = false;
       userStoppedRecognitionRef.current = true;
       setIsRecording(false);
-      setCaptionText(DEFAULT_CAPTION_TEXT);
+      captionLinesRef.current = [];
+      setCaptionLines([DEFAULT_CAPTION_TEXT]);
       setHasRecording(false);
       mediaRecorderRef.current = null;
       releaseMediaStream();
@@ -792,6 +880,7 @@ export default function useMirrorPractice(defaultLanguage) {
       safelyStopRecognition();
     }
   }, [
+    applyCaptionLines,
     attachPreviewStream,
     clearRecognitionRestart,
     clearInterimSubtitleFlushTimer,
@@ -803,8 +892,10 @@ export default function useMirrorPractice(defaultLanguage) {
     revokeRecordingUrl,
     safelyStopRecognition,
     selectedLanguage,
+    startAudioAnalysis,
     startCanvasRenderer,
     startElapsedTimer,
+    stopAudioAnalysis,
     stopElapsedTimer,
     stopSession,
     updateElapsed,
@@ -815,31 +906,34 @@ export default function useMirrorPractice(defaultLanguage) {
       return undefined;
     }
 
-    const recognition = new recognitionClass();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
+    const recognition = createConfiguredRecognition(recognitionClass);
     recognitionRef.current = recognition;
 
     recognition.onresult = (event) => {
+      // Results finalised after Stop are ignored so the downloaded transcript
+      // always matches the metrics computed at the moment the take ended.
+      if (userStoppedRecognitionRef.current) {
+        return;
+      }
+
       for (let index = event.resultIndex; index < event.results.length; index += 1) {
         const result = event.results[index];
         const transcript = result[0]?.transcript ?? "";
 
         if (result.isFinal) {
-          appendTranscriptText(transcript);
+          appendTranscriptText(transcript, result[0]?.confidence);
           clearInterimSubtitleFlushTimer();
           interimSubtitleRef.current = "";
           pendingInterimSubtitleRef.current = "";
           lastInterimSubtitlePaintAtRef.current = 0;
-          finalSubtitleRef.current = getYouTubeStyleSubtitleText(transcript);
-          finalSubtitleExpiresAtRef.current = finalSubtitleRef.current
-            ? Date.now() + FINAL_SUBTITLE_HOLD_MS
-            : 0;
-          showSubtitleThenHide(finalSubtitleRef.current);
+          captionBufferRef.current = appendCaptionText(captionBufferRef.current, transcript);
+          const nextCaptionLines = buildCaptionLines(captionBufferRef.current);
+          // Keep only the visible lines (with their breaks committed) so the
+          // buffer stays small and existing lines never re-wrap.
+          captionBufferRef.current = nextCaptionLines.join("\n");
+          showSubtitleThenHide(nextCaptionLines);
         } else {
-          const nextCaptionText = getYouTubeStyleSubtitleText(transcript);
-          showInterimSubtitle(nextCaptionText);
+          showInterimSubtitle(transcript.trim());
         }
       }
     };
@@ -854,13 +948,14 @@ export default function useMirrorPractice(defaultLanguage) {
         interimSubtitleRef.current = "";
         pendingInterimSubtitleRef.current = "";
         lastInterimSubtitlePaintAtRef.current = 0;
-        showSubtitleThenHide(finalSubtitleRef.current);
+        showSubtitleThenHide(buildCaptionLines(captionBufferRef.current));
         return;
       }
 
       setErrorMessage(`Recognition error: ${event.error}. Your session has ended.`);
 
       if (FATAL_RECOGNITION_ERRORS.has(event.error)) {
+        sessionFailedRef.current = true;
         stopSession();
       }
     };
@@ -869,13 +964,18 @@ export default function useMirrorPractice(defaultLanguage) {
       if (!userStoppedRecognitionRef.current && isSessionActiveRef.current) {
         clearRecognitionRestart();
         restartTimeoutRef.current = window.setTimeout(() => {
-          if (userStoppedRecognitionRef.current || recognitionRef.current !== recognition || !isSessionActiveRef.current) {
+          if (
+            userStoppedRecognitionRef.current ||
+            recognitionRef.current !== recognition ||
+            !isSessionActiveRef.current
+          ) {
             return;
           }
 
           try {
             recognition.start();
-          } catch (error) {
+          } catch {
+            sessionFailedRef.current = true;
             setErrorMessage("Live transcription stopped unexpectedly. Your session has ended.");
             stopSession();
           }
@@ -893,12 +993,13 @@ export default function useMirrorPractice(defaultLanguage) {
       recognitionRef.current = null;
     };
   }, [
-    clearRecognitionRestart,
     appendTranscriptText,
+    clearRecognitionRestart,
     clearInterimSubtitleFlushTimer,
     clearSubtitleHideTimer,
     isSupported,
     recognitionClass,
+    showInterimSubtitle,
     safelyStopRecognition,
     showSubtitleThenHide,
     stopSession,
@@ -934,7 +1035,8 @@ export default function useMirrorPractice(defaultLanguage) {
     unsupportedMessage,
     selectedLanguage,
     setSelectedLanguage,
-    captionText,
+    captionLines,
+    stageAspectRatio,
     isRecording,
     elapsedTime,
     errorMessage,
@@ -942,7 +1044,9 @@ export default function useMirrorPractice(defaultLanguage) {
     hasCompletedTake,
     recordingUrl,
     downloadFileName,
-    transcriptText,
+    transcriptEntries,
+    takeMetrics,
+    previousTakeMetrics,
     previewVideoRef,
     startSession,
     stopSession,

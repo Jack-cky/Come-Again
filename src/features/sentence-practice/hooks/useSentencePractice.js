@@ -1,12 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import useIntervalTicker from "../../../shared/hooks/useIntervalTicker";
 import {
+  createConfiguredRecognition,
   FATAL_RECOGNITION_ERRORS,
   formatTime,
   getSpeechRecognitionClass,
   NON_BLOCKING_RECOGNITION_ERRORS,
 } from "../../../shared/speechRecognition";
+import { useJapanesePhonetics } from "../services/japanesePhonetics";
 import { stopPronunciation } from "../services/pronunciationService";
 import { computeAccuracy } from "../utils/textAnalysis";
+import {
+  createSeekablePlayer,
+  decodeArrayBufferToAudioBuffer,
+  stopSharedPlayback,
+} from "../../../shared/webAudioPlayback";
 
 const DEFAULT_INTERIM_TRANSCRIPT = "Your words will appear here as you speak.";
 const PREFERRED_RECORDING_MIME_TYPES = [
@@ -26,8 +34,10 @@ function isIOSDevice() {
     return false;
   }
 
-  return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  return (
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  );
 }
 
 function getSupportedRecordingMimeType(MediaRecorderClass) {
@@ -82,7 +92,6 @@ export default function useSentencePractice(defaultLanguage) {
   const totalCharactersRef = useRef(0);
   const sumConfidenceRef = useRef(0);
   const finalResultCountRef = useRef(0);
-  const elapsedTimerRef = useRef(null);
   const restartTimeoutRef = useRef(null);
   const audioContextRef = useRef(null);
   const analyserNodeRef = useRef(null);
@@ -96,15 +105,23 @@ export default function useSentencePractice(defaultLanguage) {
   const audioBlobRef = useRef(null);
   const currentAudioRef = useRef(null);
   const currentAudioUrlRef = useRef("");
+  const seekablePlayerRef = useRef(null);
   const nonFatalErrorOccurredRef = useRef(false);
+
+  // Downloads the Japanese reading dictionary lazily; accuracy and the
+  // transcript diff recompute once it is ready so kanji/kana spellings match.
+  const phoneticsStatus = useJapanesePhonetics(selectedLanguage);
 
   useEffect(() => {
     isListeningRef.current = isListening;
   }, [isListening]);
 
   useEffect(() => {
-    setAccuracy(computeAccuracy(referenceText, finalTranscript));
-  }, [referenceText, finalTranscript]);
+    setAccuracy(computeAccuracy(referenceText, finalTranscript, selectedLanguage));
+    // phoneticsStatus is an intentional extra dependency: computeAccuracy
+    // reads the module-level Japanese tokenizer, so the score must recompute
+    // when the dictionary finishes loading.
+  }, [referenceText, finalTranscript, selectedLanguage, phoneticsStatus]);
 
   const updateElapsed = useCallback(() => {
     if (!sessionStartMsRef.current) {
@@ -121,30 +138,11 @@ export default function useSentencePractice(defaultLanguage) {
     const elapsedMinutes = elapsedMs / 60000;
 
     setElapsedTime(formatTime(elapsedSeconds));
-    setCharactersPerMinute(
-      elapsedMinutes > 0 ? Math.round(totalCharactersRef.current / elapsedMinutes) : 0
-    );
+    setCharactersPerMinute(elapsedMinutes > 0 ? Math.round(totalCharactersRef.current / elapsedMinutes) : 0);
     setCharacterCount(totalCharactersRef.current);
   }, []);
 
-  const startElapsedTimer = useCallback(() => {
-    if (elapsedTimerRef.current) {
-      return;
-    }
-
-    elapsedTimerRef.current = window.setInterval(() => {
-      updateElapsed();
-    }, 500);
-  }, [updateElapsed]);
-
-  const stopElapsedTimer = useCallback(() => {
-    if (elapsedTimerRef.current) {
-      window.clearInterval(elapsedTimerRef.current);
-      elapsedTimerRef.current = null;
-    }
-
-    updateElapsed();
-  }, [updateElapsed]);
+  const { start: startElapsedTimer, stop: stopElapsedTimer } = useIntervalTicker(updateElapsed);
 
   const clearRecognitionRestart = useCallback(() => {
     if (restartTimeoutRef.current) {
@@ -260,10 +258,7 @@ export default function useSentencePractice(defaultLanguage) {
   }, [isIOS]);
 
   const startMeter = useCallback(async () => {
-    if (
-      typeof navigator === "undefined" ||
-      !navigator.mediaDevices?.getUserMedia
-    ) {
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       return;
     }
 
@@ -303,7 +298,10 @@ export default function useSentencePractice(defaultLanguage) {
       }
 
       if (sourceNodeRef.current && audioContextRef.current.state !== "closed") {
-        if (audioContextRef.current.state === "suspended" && typeof audioContextRef.current.resume === "function") {
+        if (
+          audioContextRef.current.state === "suspended" &&
+          typeof audioContextRef.current.resume === "function"
+        ) {
           audioContextRef.current.resume().catch(() => undefined);
           if (!userStoppedRef.current && isListeningRef.current) {
             drawMeter();
@@ -312,7 +310,10 @@ export default function useSentencePractice(defaultLanguage) {
         return;
       }
 
-      if (audioContextRef.current.state === "suspended" && typeof audioContextRef.current.resume === "function") {
+      if (
+        audioContextRef.current.state === "suspended" &&
+        typeof audioContextRef.current.resume === "function"
+      ) {
         audioContextRef.current.resume().catch(() => undefined);
       }
 
@@ -325,7 +326,7 @@ export default function useSentencePractice(defaultLanguage) {
       analyserNodeRef.current.fftSize = 512;
       sourceNodeRef.current.connect(analyserNodeRef.current);
       drawMeter();
-    } catch (error) {
+    } catch {
       setErrorMessage("Microphone level meter is unavailable. Check browser permissions.");
     }
   }, [drawMeter, isIOS, releaseMediaStream]);
@@ -434,6 +435,7 @@ export default function useSentencePractice(defaultLanguage) {
       recordedChunksRef.current = [];
       recordingMimeTypeRef.current = preferredMimeType;
       audioBlobRef.current = null;
+      seekablePlayerRef.current = null;
       setHasRecording(false);
 
       const newRecorder = preferredMimeType
@@ -447,14 +449,17 @@ export default function useSentencePractice(defaultLanguage) {
       };
       newRecorder.onerror = () => {
         audioBlobRef.current = null;
+        seekablePlayerRef.current = null;
         setHasRecording(false);
         setErrorMessage("Audio recording failed. Please try again.");
       };
       newRecorder.onstop = () => {
-        const blobType = recordedChunksRef.current.find((chunk) => chunk.type)?.type ?? recordingMimeTypeRef.current;
+        const blobType =
+          recordedChunksRef.current.find((chunk) => chunk.type)?.type ?? recordingMimeTypeRef.current;
 
         if (!recordedChunksRef.current.length) {
           audioBlobRef.current = null;
+          seekablePlayerRef.current = null;
           setHasRecording(false);
           if (mediaRecorderRef.current === newRecorder) {
             mediaRecorderRef.current = null;
@@ -466,6 +471,8 @@ export default function useSentencePractice(defaultLanguage) {
         audioBlobRef.current = blobType
           ? new Blob(recordedChunksRef.current, { type: blobType })
           : new Blob(recordedChunksRef.current);
+        // A fresh take invalidates any decoded player from a previous recording.
+        seekablePlayerRef.current = null;
         setHasRecording(true);
         if (mediaRecorderRef.current === newRecorder) {
           mediaRecorderRef.current = null;
@@ -480,9 +487,10 @@ export default function useSentencePractice(defaultLanguage) {
       }
 
       return true;
-    } catch (error) {
+    } catch {
       mediaRecorderRef.current = null;
       audioBlobRef.current = null;
+      seekablePlayerRef.current = null;
       setHasRecording(false);
       setErrorMessage("Audio recording failed to start in this browser.");
       releaseMediaStream();
@@ -504,13 +512,17 @@ export default function useSentencePractice(defaultLanguage) {
   const safelyStopRecognition = useCallback(() => {
     try {
       recognitionRef.current?.stop();
-    } catch (error) {
+    } catch {
       // Ignore InvalidStateError when recognition is already stopped.
     }
   }, []);
 
   const stopCurrentAudio = useCallback(() => {
     setIsPlaying(false);
+    stopSharedPlayback();
+    // Full reset (not just pause) since this runs at session boundaries where
+    // any in-progress playback position should not carry over.
+    seekablePlayerRef.current?.stop();
 
     if (currentAudioRef.current) {
       const audio = currentAudioRef.current;
@@ -528,15 +540,9 @@ export default function useSentencePractice(defaultLanguage) {
     }
   }, []);
 
+  // Clears the whole session unconditionally; the page confirms with the
+  // user first so this hook stays free of UI concerns.
   const resetSession = useCallback(async () => {
-    const confirmed = window.confirm(
-      "Start over?\n\nThis clears your transcript, recording, and session metrics so you can practice a new passage."
-    );
-
-    if (!confirmed) {
-      return;
-    }
-
     stopCurrentAudio();
     stopPronunciation();
     clearRecognitionRestart();
@@ -567,6 +573,7 @@ export default function useSentencePractice(defaultLanguage) {
     lastFinalResultMsRef.current = 0;
     nonFatalErrorOccurredRef.current = false;
     audioBlobRef.current = null;
+    seekablePlayerRef.current = null;
     recordedChunksRef.current = [];
     recordingMimeTypeRef.current = "";
   }, [
@@ -597,10 +604,7 @@ export default function useSentencePractice(defaultLanguage) {
       // ignore
     }
 
-    const recognition = new recognitionClass();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
+    const recognition = createConfiguredRecognition(recognitionClass);
     recognitionRef.current = recognition;
 
     recognition.onresult = (event) => {
@@ -688,10 +692,12 @@ export default function useSentencePractice(defaultLanguage) {
             recognition.start();
             isListeningRef.current = true;
             setIsListening(true);
-          } catch (error) {
+          } catch {
             isListeningRef.current = false;
             setIsListening(false);
-            setErrorMessage("Speech recognition stopped unexpectedly. Please press Start Recording to try again.");
+            setErrorMessage(
+              "Speech recognition stopped unexpectedly. Please press Start Recording to try again.",
+            );
           }
         }, 250);
         return;
@@ -705,7 +711,9 @@ export default function useSentencePractice(defaultLanguage) {
       }
 
       if (!userStoppedRef.current && !nonFatalErrorOccurredRef.current) {
-        setErrorMessage("Speech recognition stopped unexpectedly on this device. Please press Start Recording to try again.");
+        setErrorMessage(
+          "Speech recognition stopped unexpectedly on this device. Please press Start Recording to try again.",
+        );
         stopRecording();
         stopMeter();
         releaseMediaStreamIfRecorderInactive();
@@ -811,7 +819,7 @@ export default function useSentencePractice(defaultLanguage) {
       setErrorMessage(
         error instanceof Error && error.message === "recording-start-failed"
           ? "Failed to start audio recording. Check browser permissions and try again."
-          : "Failed to start speech recognition. Please try again."
+          : "Failed to start speech recognition. Please try again.",
       );
     }
   }, [
@@ -853,12 +861,50 @@ export default function useSentencePractice(defaultLanguage) {
     stopRecording,
   ]);
 
-  const playRecording = useCallback(() => {
+  const playRecording = useCallback(async () => {
     if (!audioBlobRef.current || isListeningRef.current) {
       return;
     }
 
     stopPronunciation();
+
+    // iOS Safari treats <audio> playback as a session-category change that can
+    // silently break the next getUserMedia() recording, so route playback
+    // through the same persistent Web Audio graph used for pronunciation
+    // playback instead. A seekable player (offset-tracked, one source node
+    // per play() call) gives real pause/resume here, matching the <audio>
+    // element behaviour used below on non-iOS.
+    if (isIOS) {
+      const blobAtRequestStart = audioBlobRef.current;
+      // Flip the button immediately, matching the <audio>-element path below;
+      // reverted if decoding fails or the request goes stale before it settles.
+      setIsPlaying(true);
+
+      try {
+        if (!seekablePlayerRef.current) {
+          const arrayBuffer = await blobAtRequestStart.arrayBuffer();
+          const audioBuffer = await decodeArrayBufferToAudioBuffer(arrayBuffer);
+
+          // Bail if a reset/new recording/new session moved on while decoding.
+          if (audioBlobRef.current !== blobAtRequestStart || isListeningRef.current) {
+            setIsPlaying(false);
+            return;
+          }
+
+          const player = createSeekablePlayer(audioBuffer);
+          player.onEnded = () => setIsPlaying(false);
+          seekablePlayerRef.current = player;
+        }
+
+        seekablePlayerRef.current.play();
+      } catch {
+        seekablePlayerRef.current = null;
+        setIsPlaying(false);
+        setErrorMessage("Unable to play the audio recording in this browser.");
+      }
+
+      return;
+    }
 
     const existingAudio = currentAudioRef.current;
 
@@ -887,9 +933,15 @@ export default function useSentencePractice(defaultLanguage) {
       stopCurrentAudio();
       setErrorMessage("Unable to play the audio recording in this browser.");
     });
-  }, [stopCurrentAudio]);
+  }, [isIOS, stopCurrentAudio]);
 
   const pausePlayback = useCallback(() => {
+    if (isIOS) {
+      seekablePlayerRef.current?.pause();
+      setIsPlaying(false);
+      return;
+    }
+
     const audio = currentAudioRef.current;
 
     if (!audio) {
@@ -899,7 +951,7 @@ export default function useSentencePractice(defaultLanguage) {
 
     audio.pause();
     setIsPlaying(false);
-  }, []);
+  }, [isIOS]);
 
   useEffect(() => {
     if (!isSupported) {
@@ -915,12 +967,7 @@ export default function useSentencePractice(defaultLanguage) {
       safelyStopRecognition();
       recognitionRef.current = null;
     };
-  }, [
-    clearRecognitionRestart,
-    initializeRecognition,
-    isSupported,
-    safelyStopRecognition,
-  ]);
+  }, [clearRecognitionRestart, initializeRecognition, isSupported, safelyStopRecognition]);
 
   useEffect(() => {
     return () => {
@@ -935,10 +982,18 @@ export default function useSentencePractice(defaultLanguage) {
         audioContextRef.current.close().catch(() => undefined);
       }
     };
-  }, [clearRecognitionRestart, releaseMediaStream, stopCurrentAudio, stopElapsedTimer, stopMeter, stopRecording]);
+  }, [
+    clearRecognitionRestart,
+    releaseMediaStream,
+    stopCurrentAudio,
+    stopElapsedTimer,
+    stopMeter,
+    stopRecording,
+  ]);
 
   return {
     isSupported,
+    phoneticsStatus,
     selectedLanguage,
     setSelectedLanguage,
     referenceText,
@@ -955,7 +1010,6 @@ export default function useSentencePractice(defaultLanguage) {
     hasRecording,
     hasUserStopped,
     isPlaying,
-    canPlaybackRecording: !isIOS,
     canReset: !isListening && (Boolean(finalTranscript.trim()) || hasRecording || hasUserStopped),
     canvasRef,
     startListening,

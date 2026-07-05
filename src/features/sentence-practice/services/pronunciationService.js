@@ -1,11 +1,10 @@
-import { DEFAULT_LANGUAGE } from "../constants/languages";
+import fetchWithTimeout from "../../../shared/fetchWithTimeout";
+import { playArrayBufferOnce, stopSharedPlayback } from "../../../shared/webAudioPlayback";
+import { DEFAULT_LANGUAGE, isEnglishLanguage } from "../constants/languages";
 
-const ENGLISH_PREFIX = "en";
-const DICTIONARY_API_BASE_URL =
-  import.meta.env.VITE_DICTIONARY_API_BASE_URL ?? "https://api.dictionaryapi.dev/api/v2/entries/en";
+const DICTIONARY_API_BASE_URL = "https://api.dictionaryapi.dev/api/v2/entries/en";
 const DICTIONARY_REQUEST_TIMEOUT_MS = 5000;
 const dictionaryAudioCache = new Map();
-let activeDictionaryAudio = null;
 
 function normalizeDictionaryAudioUrl(audioUrl) {
   if (!audioUrl) {
@@ -15,33 +14,16 @@ function normalizeDictionaryAudioUrl(audioUrl) {
   return audioUrl.startsWith("//") ? `https:${audioUrl}` : audioUrl;
 }
 
-function stopDictionaryAudio() {
-  if (!activeDictionaryAudio) {
-    return;
-  }
-
-  activeDictionaryAudio.pause();
-  activeDictionaryAudio.currentTime = 0;
-  activeDictionaryAudio = null;
-}
-
 export function stopPronunciation() {
-  stopDictionaryAudio();
+  stopSharedPlayback();
 
   if (typeof window !== "undefined" && window.speechSynthesis) {
     window.speechSynthesis.cancel();
   }
 }
 
-async function fetchWithTimeout(url) {
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), DICTIONARY_REQUEST_TIMEOUT_MS);
-
-  try {
-    return await fetch(url, { signal: controller.signal });
-  } finally {
-    window.clearTimeout(timeoutId);
-  }
+function fetchDictionaryResponse(url) {
+  return fetchWithTimeout(url, { timeoutMs: DICTIONARY_REQUEST_TIMEOUT_MS });
 }
 
 async function fetchEnglishDictionaryAudio(word) {
@@ -56,7 +38,9 @@ async function fetchEnglishDictionaryAudio(word) {
   }
 
   try {
-    const response = await fetchWithTimeout(`${DICTIONARY_API_BASE_URL}/${encodeURIComponent(normalizedWord)}`);
+    const response = await fetchDictionaryResponse(
+      `${DICTIONARY_API_BASE_URL}/${encodeURIComponent(normalizedWord)}`,
+    );
 
     if (!response.ok) {
       dictionaryAudioCache.set(normalizedWord, "");
@@ -70,35 +54,21 @@ async function fetchEnglishDictionaryAudio(word) {
     const audioUrl = normalizeDictionaryAudioUrl(preferredAudio?.audio ?? fallbackAudio?.audio ?? "");
     dictionaryAudioCache.set(normalizedWord, audioUrl);
     return audioUrl;
-  } catch (error) {
+  } catch {
     dictionaryAudioCache.set(normalizedWord, "");
     return "";
   }
 }
 
-function playDictionaryAudio(audioUrl) {
-  return new Promise((resolve, reject) => {
-    stopDictionaryAudio();
+async function playDictionaryAudio(audioUrl) {
+  const response = await fetchDictionaryResponse(audioUrl);
 
-    const audio = new Audio(audioUrl);
-    activeDictionaryAudio = audio;
+  if (!response.ok) {
+    throw new Error("Unable to fetch dictionary audio.");
+  }
 
-    audio.onended = () => {
-      if (activeDictionaryAudio === audio) {
-        activeDictionaryAudio = null;
-      }
-      resolve();
-    };
-
-    audio.onerror = () => {
-      if (activeDictionaryAudio === audio) {
-        activeDictionaryAudio = null;
-      }
-      reject(new Error("Unable to play dictionary audio."));
-    };
-
-    audio.play().catch(reject);
-  });
+  const arrayBuffer = await response.arrayBuffer();
+  await playArrayBufferOnce(arrayBuffer);
 }
 
 function speakWithSynthesis(word, languageCode) {
@@ -108,7 +78,7 @@ function speakWithSynthesis(word, languageCode) {
       return;
     }
 
-    stopDictionaryAudio();
+    stopSharedPlayback();
     window.speechSynthesis.cancel();
 
     const utterance = new SpeechSynthesisUtterance(word);
@@ -127,14 +97,14 @@ export async function speakCorrectWord(word, languageCode) {
     return;
   }
 
-  if ((languageCode ?? "").startsWith(ENGLISH_PREFIX)) {
+  if (isEnglishLanguage(languageCode)) {
     const audioUrl = await fetchEnglishDictionaryAudio(normalizedWord);
 
     if (audioUrl) {
       try {
         await playDictionaryAudio(audioUrl);
         return;
-      } catch (error) {
+      } catch {
         // Fall back to browser speech synthesis below.
       }
     }

@@ -1,10 +1,14 @@
+import fetchWithTimeout from "../../../shared/fetchWithTimeout";
+
 const WIKIPEDIA_HOME_URL = "https://en.wikipedia.org/";
 const ADVICE_SLIP_HOME_URL = "https://api.adviceslip.com/";
-const WIKIPEDIA_RANDOM_SUMMARY_URL =
-  import.meta.env.VITE_WIKIPEDIA_RANDOM_SUMMARY_URL ?? "https://en.wikipedia.org/api/rest_v1/page/random/summary";
-const ADVICE_SLIP_URL = import.meta.env.VITE_ADVICE_SLIP_URL ?? "https://api.adviceslip.com/advice";
+const TATOEBA_HOME_URL = "https://tatoeba.org/en/sentences_lists/search?lang=jpn";
+const WIKIPEDIA_RANDOM_SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/random/summary";
+const ADVICE_SLIP_URL = "https://api.adviceslip.com/advice";
+const TATOEBA_URL = "https://api.tatoeba.org/unstable/sentences?lang=jpn&sort=random&limit=5";
 const REQUEST_TIMEOUT_MS = 8000;
 const PASSAGE_FETCH_RETRY_COUNT = 1;
+const TATOEBA_MIN_LENGTH = 6;
 const FALLBACK_PRACTICE_PASSAGES = [
   {
     title: "Built-in practice passage",
@@ -22,14 +26,28 @@ const FALLBACK_PRACTICE_PASSAGES = [
       "Strong pronunciation comes from repetition, rhythm, and attention to difficult sounds. Speak this paragraph twice and notice which words require extra control.",
   },
 ];
+const FALLBACK_JAPANESE_PASSAGES = [
+  {
+    title: "Built-in practice passage",
+    passage: "毎日少しずつ練習すれば、発音は必ず上手になります。",
+  },
+  {
+    title: "Offline speaking drill",
+    passage: "ゆっくり話して、一つ一つの音をはっきり発音しましょう。",
+  },
+  {
+    title: "Pronunciation warm-up",
+    passage: "この文章を声に出して読んで、リズムに注意してください。",
+  },
+];
 
 function normalizeReferenceText(text) {
   return text.replace(/\s+/g, " ").trim();
 }
 
-function getRandomFallbackPassage() {
-  const index = Math.floor(Math.random() * FALLBACK_PRACTICE_PASSAGES.length);
-  return FALLBACK_PRACTICE_PASSAGES[index];
+function getRandomFallbackPassage(passages = FALLBACK_PRACTICE_PASSAGES) {
+  const index = Math.floor(Math.random() * passages.length);
+  return passages[index];
 }
 
 async function retryPassageRequest(loadPassage) {
@@ -46,22 +64,12 @@ async function retryPassageRequest(loadPassage) {
   throw lastError;
 }
 
-async function fetchResponseWithTimeout(url, options = {}) {
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-  try {
-    return await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
-  } finally {
-    window.clearTimeout(timeoutId);
-  }
+function fetchResponseWithTimeout(url, options = {}) {
+  return fetchWithTimeout(url, { ...options, timeoutMs: REQUEST_TIMEOUT_MS });
 }
 
-function buildFallbackPassage(provider, sourceUrl) {
-  const fallback = getRandomFallbackPassage();
+function buildFallbackPassage(provider, sourceUrl, passages = FALLBACK_PRACTICE_PASSAGES) {
+  const fallback = getRandomFallbackPassage(passages);
   return {
     provider: `${provider} fallback`,
     passage: fallback.passage,
@@ -94,7 +102,7 @@ export async function fetchWikipediaPassage() {
         url: payload.content_urls?.desktop?.page ?? WIKIPEDIA_HOME_URL,
       };
     });
-  } catch (error) {
+  } catch {
     return buildFallbackPassage("Wikipedia", WIKIPEDIA_HOME_URL);
   }
 }
@@ -127,7 +135,38 @@ export async function fetchAdviceSlipPassage() {
         url: ADVICE_SLIP_HOME_URL,
       };
     });
-  } catch (error) {
+  } catch {
     return buildFallbackPassage("Advice Slip", ADVICE_SLIP_HOME_URL);
+  }
+}
+
+export async function fetchTatoebaPassage() {
+  try {
+    return await retryPassageRequest(async () => {
+      const response = await fetchResponseWithTimeout(TATOEBA_URL);
+
+      if (!response.ok) {
+        throw new Error(`Tatoeba request failed with ${response.status}.`);
+      }
+
+      const payload = await response.json();
+      const candidates = Array.isArray(payload.data) ? payload.data : [];
+      const sentence = candidates.find(
+        (entry) => normalizeReferenceText(entry.text ?? "").length >= TATOEBA_MIN_LENGTH,
+      );
+
+      if (!sentence) {
+        throw new Error("Tatoeba returned no usable sentence.");
+      }
+
+      return {
+        provider: "Tatoeba",
+        passage: normalizeReferenceText(sentence.text),
+        title: `Tatoeba sentence #${sentence.id}`,
+        url: `https://tatoeba.org/en/sentences/show/${sentence.id}`,
+      };
+    });
+  } catch {
+    return buildFallbackPassage("Tatoeba", TATOEBA_HOME_URL, FALLBACK_JAPANESE_PASSAGES);
   }
 }

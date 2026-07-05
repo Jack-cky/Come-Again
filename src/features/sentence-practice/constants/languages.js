@@ -1,4 +1,9 @@
 export const DEFAULT_LANGUAGE = "en-GB";
+export const ENGLISH_LANGUAGE_PREFIX = "en";
+
+export function isEnglishLanguage(languageCode) {
+  return (languageCode ?? "").toLowerCase().startsWith(ENGLISH_LANGUAGE_PREFIX);
+}
 
 export const LANGUAGE_OPTIONS = [
   { value: DEFAULT_LANGUAGE, label: "🇬🇧 English (UK)" },
@@ -26,7 +31,9 @@ export function getPreferredLanguage() {
     }
 
     const languagePrefix = browserLanguage.toLowerCase().split("-")[0];
-    const prefixMatch = LANGUAGE_OPTIONS.find((language) => language.value.toLowerCase().startsWith(languagePrefix));
+    const prefixMatch = LANGUAGE_OPTIONS.find((language) =>
+      language.value.toLowerCase().startsWith(languagePrefix),
+    );
 
     if (prefixMatch) {
       return prefixMatch.value;

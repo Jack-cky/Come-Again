@@ -19,3 +19,13 @@ export function getSpeechRecognitionClass() {
 
   return window.SpeechRecognition || window.webkitSpeechRecognition || null;
 }
+
+// Both practice modes run recognition with the same base configuration:
+// continuous listening with interim results and a single alternative.
+export function createConfiguredRecognition(RecognitionClass) {
+  const recognition = new RecognitionClass();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.maxAlternatives = 1;
+  return recognition;
+}

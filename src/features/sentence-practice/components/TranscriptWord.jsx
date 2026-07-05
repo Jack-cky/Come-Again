@@ -17,7 +17,7 @@ function getPronunciationTarget(segment) {
   return "";
 }
 
-export default function TranscriptWord({ segment, languageCode }) {
+export default function TranscriptWord({ segment, languageCode, onBeforeSpeak }) {
   const [isTooltipVisible, setIsTooltipVisible] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [tooltipPosition, setTooltipPosition] = useState({ left: 0, top: 0 });
@@ -38,7 +38,7 @@ export default function TranscriptWord({ segment, languageCode }) {
     const rect = wordElement.getBoundingClientRect();
     const halfTooltipWidth = Math.min(
       TOOLTIP_MAX_WIDTH / 2,
-      Math.max(window.innerWidth / 2 - VIEWPORT_PADDING, 0)
+      Math.max(window.innerWidth / 2 - VIEWPORT_PADDING, 0),
     );
     const minLeft = VIEWPORT_PADDING + halfTooltipWidth;
     const maxLeft = window.innerWidth - VIEWPORT_PADDING - halfTooltipWidth;
@@ -75,16 +75,17 @@ export default function TranscriptWord({ segment, languageCode }) {
       return;
     }
 
+    onBeforeSpeak?.();
     setIsSpeaking(true);
 
     try {
       await speakCorrectWord(pronunciationTarget, languageCode);
-    } catch (error) {
+    } catch {
       // Ignore playback errors so transcript interaction stays responsive.
     } finally {
       setIsSpeaking(false);
     }
-  }, [canSpeak, isSpeaking, languageCode, pronunciationTarget]);
+  }, [canSpeak, isSpeaking, languageCode, onBeforeSpeak, pronunciationTarget]);
 
   const handleKeyDown = useCallback(
     (event) => {
@@ -97,7 +98,7 @@ export default function TranscriptWord({ segment, languageCode }) {
         handleSpeak();
       }
     },
-    [canSpeak, handleSpeak]
+    [canSpeak, handleSpeak],
   );
 
   const handleMouseLeave = useCallback(() => {
@@ -146,7 +147,7 @@ export default function TranscriptWord({ segment, languageCode }) {
             </span>
             {canSpeak && <span className="word-tooltip-action">Click to hear the pronunciation.</span>}
           </span>,
-          document.body
+          document.body,
         )}
     </span>
   );

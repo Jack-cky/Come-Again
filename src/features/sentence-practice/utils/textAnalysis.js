@@ -1,23 +1,31 @@
-const ENGLISH_PREFIX = "en";
+import {
+  foldKatakanaToHiragana,
+  isJapaneseLanguage,
+  isJapanesePhoneticsReady,
+  toJapanesePhoneticKey,
+  tokenizeJapaneseChunks,
+} from "../services/japanesePhonetics";
+import { ENGLISH_LANGUAGE_PREFIX, isEnglishLanguage } from "../constants/languages";
 const UNICODE_WORD_CHARACTER_CLASS =
   "\\p{L}\\p{N}\\p{Script=Han}\\p{Script=Hiragana}\\p{Script=Katakana}\\p{Script=Hangul}";
-const FALLBACK_WORD_CHARACTER_CLASS = "A-Za-z0-9\\u00C0-\\u024F\\u0300-\\u036F\\u3040-\\u30FF\\u3400-\\u9FFF\\uAC00-\\uD7AF";
+const FALLBACK_WORD_CHARACTER_CLASS =
+  "A-Za-z0-9\\u00C0-\\u024F\\u0300-\\u036F\\u3040-\\u30FF\\u3400-\\u9FFF\\uAC00-\\uD7AF";
 
 function buildSafeRegExp(unicodePattern, fallbackPattern) {
   try {
     return new RegExp(unicodePattern, "gu");
-  } catch (error) {
+  } catch {
     return new RegExp(fallbackPattern, "g");
   }
 }
 
 const WORD_BOUNDARY_PATTERN = buildSafeRegExp(
   `[^${UNICODE_WORD_CHARACTER_CLASS}'’]+`,
-  `[^${FALLBACK_WORD_CHARACTER_CLASS}'’]+`
+  `[^${FALLBACK_WORD_CHARACTER_CLASS}'’]+`,
 );
 const COMPARISON_CHARACTER_PATTERN = buildSafeRegExp(
   `[^${UNICODE_WORD_CHARACTER_CLASS}]`,
-  `[^${FALLBACK_WORD_CHARACTER_CLASS}]`
+  `[^${FALLBACK_WORD_CHARACTER_CLASS}]`,
 );
 
 function stripWhitespace(value) {
@@ -25,9 +33,15 @@ function stripWhitespace(value) {
 }
 
 function normalizeForComparison(value, languageCode) {
+  if (isJapaneseLanguage(languageCode)) {
+    // Compare Japanese by phonetic reading so kanji and kana spellings of the
+    // same phrase match (話して vs はなして vs ハナシテ).
+    return toJapanesePhoneticKey(value ?? "").replace(COMPARISON_CHARACTER_PATTERN, "");
+  }
+
   const normalized = (value ?? "").normalize("NFKD").replace(COMPARISON_CHARACTER_PATTERN, "");
 
-  if ((languageCode ?? "").startsWith(ENGLISH_PREFIX)) {
+  if (isEnglishLanguage(languageCode)) {
     return normalized.toLowerCase();
   }
 
@@ -56,7 +70,7 @@ function levenshteinDistance(a, b) {
       currentRow[j] = Math.min(
         previousRow[j] + 1,
         currentRow[j - 1] + 1,
-        previousRow[j - 1] + substitutionCost
+        previousRow[j - 1] + substitutionCost,
       );
     }
 
@@ -66,9 +80,9 @@ function levenshteinDistance(a, b) {
   return previousRow[right.length];
 }
 
-export function computeAccuracy(referenceText, hypothesisText) {
-  const reference = normalizeForComparison(referenceText, ENGLISH_PREFIX);
-  const hypothesis = normalizeForComparison(hypothesisText, ENGLISH_PREFIX);
+export function computeAccuracy(referenceText, hypothesisText, languageCode = ENGLISH_LANGUAGE_PREFIX) {
+  const reference = normalizeForComparison(referenceText, languageCode);
+  const hypothesis = normalizeForComparison(hypothesisText, languageCode);
 
   if (!reference) {
     return null;
@@ -89,7 +103,11 @@ function charsEqual(left, right, languageCode) {
     return false;
   }
 
-  if ((languageCode ?? "").startsWith(ENGLISH_PREFIX)) {
+  if (isJapaneseLanguage(languageCode)) {
+    return foldKatakanaToHiragana(left) === foldKatakanaToHiragana(right);
+  }
+
+  if (isEnglishLanguage(languageCode)) {
     return left.toLowerCase() === right.toLowerCase();
   }
 
@@ -98,12 +116,55 @@ function charsEqual(left, right, languageCode) {
 
 function isEastAsianLanguage(languageCode) {
   const code = (languageCode ?? "").toLowerCase();
-  return (
-    code.startsWith("zh") ||
-    code.startsWith("yue") ||
-    code.startsWith("ja") ||
-    code.startsWith("ko")
-  );
+  return code.startsWith("zh") || code.startsWith("yue") || code.startsWith("ja") || code.startsWith("ko");
+}
+
+// Japanese and Chinese do not delimit words with whitespace, so the naive
+// regex tokenizer below cannot find real word boundaries for them. Where
+// available, Intl.Segmenter's dictionary-based word segmentation gives real
+// words instead, which is what lets these languages share the same
+// word-level diff/highlight logic as whitespace-delimited languages.
+const wordSegmenterCache = new Map();
+
+function getWordSegmenter(languageCode) {
+  if (typeof Intl === "undefined" || typeof Intl.Segmenter !== "function") {
+    return null;
+  }
+
+  const cacheKey = languageCode ?? "";
+
+  if (wordSegmenterCache.has(cacheKey)) {
+    return wordSegmenterCache.get(cacheKey);
+  }
+
+  let segmenter = null;
+
+  try {
+    segmenter = new Intl.Segmenter(languageCode || undefined, { granularity: "word" });
+  } catch {
+    segmenter = null;
+  }
+
+  wordSegmenterCache.set(cacheKey, segmenter);
+  return segmenter;
+}
+
+function tokenizeWithWordSegmenter(text, languageCode) {
+  const segmenter = getWordSegmenter(languageCode);
+
+  if (!segmenter) {
+    return null;
+  }
+
+  const words = [];
+
+  for (const { segment, isWordLike } of segmenter.segment(text)) {
+    if (isWordLike) {
+      words.push(segment);
+    }
+  }
+
+  return words;
 }
 
 function normalizeWordForComparison(word, languageCode) {
@@ -111,13 +172,33 @@ function normalizeWordForComparison(word, languageCode) {
   return normalizeForComparison(original, languageCode) || original;
 }
 
-function tokenizeByWords(value) {
-  return (value ?? "")
-    .normalize("NFKD")
-    .replace(WORD_BOUNDARY_PATTERN, " ")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
+export function tokenizeByWords(value, languageCode) {
+  const rawText = value ?? "";
+
+  if (isJapaneseLanguage(languageCode) && isJapanesePhoneticsReady()) {
+    // Kuromoji chunks both spellings of a phrase identically (話して and
+    // はなして), which keeps the word-level diff aligned across kanji vs kana
+    // and drops punctuation the same way the regex tokenizer does.
+    const chunks = tokenizeJapaneseChunks(rawText);
+
+    if (chunks && chunks.length) {
+      return chunks;
+    }
+  }
+
+  if (isEastAsianLanguage(languageCode)) {
+    // Segment the raw text: NFKD decomposition changes the underlying code
+    // points enough that the segmenter's dictionary matching silently stops
+    // recognising multi-character words (e.g. verb conjugations), even
+    // though the decomposed string still looks identical when rendered.
+    const segmentedWords = tokenizeWithWordSegmenter(rawText, languageCode);
+
+    if (segmentedWords && segmentedWords.length) {
+      return segmentedWords;
+    }
+  }
+
+  return rawText.normalize("NFKD").replace(WORD_BOUNDARY_PATTERN, " ").trim().split(/\s+/).filter(Boolean);
 }
 
 function wordsEqual(left, right, languageCode) {
@@ -166,7 +247,7 @@ function reconcileWordOperations(operations) {
 
     for (let index = 0; index < pairCount; index += 1) {
       reconciled.push(
-        createWordSegment("incorrect", incorrect[index].text, incorrect[index].text, missed[index].text)
+        createWordSegment("incorrect", incorrect[index].text, incorrect[index].text, missed[index].text),
       );
     }
 
@@ -196,9 +277,17 @@ function reconcileWordOperations(operations) {
 }
 
 export function resolveTranscriptMode(referenceText, hypothesisText, languageCode) {
+  if (!isEastAsianLanguage(languageCode)) {
+    return "word";
+  }
+
   const hasWhitespace = /\s/.test(referenceText ?? "") || /\s/.test(hypothesisText ?? "");
 
-  if (hasWhitespace || !isEastAsianLanguage(languageCode)) {
+  if (
+    hasWhitespace ||
+    getWordSegmenter(languageCode) ||
+    (isJapaneseLanguage(languageCode) && isJapanesePhoneticsReady())
+  ) {
     return "word";
   }
 
@@ -267,8 +356,8 @@ function mergeWordSegments(operations) {
 }
 
 function buildWordSegments(referenceText, hypothesisText, languageCode, includeMissed) {
-  const referenceWords = tokenizeByWords(referenceText);
-  const hypothesisWords = tokenizeByWords(hypothesisText);
+  const referenceWords = tokenizeByWords(referenceText, languageCode);
+  const hypothesisWords = tokenizeByWords(hypothesisText, languageCode);
 
   if (!referenceWords.length) {
     return hypothesisText ? [{ text: hypothesisText, kind: "normal" }] : [];
@@ -361,11 +450,7 @@ export function buildTranscriptSegments(referenceText, hypothesisText, languageC
   }
 
   if (mode === "word") {
-    const hasAnyWhitespace = /\s/.test(reference) || /\s/.test(hypothesis);
-
-    if (hasAnyWhitespace || !isEastAsianLanguage(languageCode)) {
-      return buildWordSegments(reference, hypothesis, languageCode, includeMissed);
-    }
+    return buildWordSegments(reference, hypothesis, languageCode, includeMissed);
   }
 
   const operations = buildAlignedOperations(reference, hypothesis, languageCode, includeMissed);

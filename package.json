@@ -1,10 +1,10 @@
 {
   "name": "come-again",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.2",
   "type": "module",
   "engines": {
-    "node": ">=20 <21"
+    "node": ">=22"
   },
   "scripts": {
     "dev": "vite",
@@ -12,6 +12,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "kuromoji": "^0.1.2",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },

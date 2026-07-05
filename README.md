@@ -11,7 +11,7 @@ Meet Come Again, a free self-study app focused on pronunciation and built to giv
 <div align="right">
   <a href="https://jack-cky.github.io/Come-Again/"><img src="https://custom-icon-badges.demolab.com/badge/React-53c1de?logo=react&logoColor=fff"></a>
   <a href="https://docs.google.com/spreadsheets/d/1hZBngU6REh5M9iyUclPlf8IyO3Iz3ZVW1exo_-vM1ks/pubhtml?gid=436381785&single=true"><img src="https://custom-icon-badges.demolab.com/badge/Backlog-319E4F?logo=Google-Sheets&logoColor=fff"></a>
-  <p><strong>First Published:</strong> 18 June 2026<br><strong>Last Updated:</strong> 18 June 2026</p>
+  <p><strong>First Published:</strong> 18 June 2026<br><strong>Last Updated:</strong> 05 July 2026</p>
 </div>
 
 
@@ -45,7 +45,7 @@ Come Again is designed to make speaking practice more immediate, practical, and 
 To support that process, the app provides reading material that users can practise in real time while tracking how closely their speech matches the reference text. This creates a feedback loop that helps learners identify weak points, revisit difficult words, and gradually improve their pronunciation through active use. While it does not replace natural conversation or a human tutor, it offers a useful stepping stone towards more confident speaking.
 
 > [!NOTE]  
-> Some latency is expected: Come Again relies on free public APIs for real-time text fetching and pronunciation feedback, which may occasionally result in slower response times or intermittent failures.
+> Latency is expected because Come Again relies on free public APIs for real-time text fetching and pronunciation feedback, which may occasionally result in slower response times or intermittent failures.
 
 <div align="center">
   <a href="https://jack-cky.github.io/Come-Again/"><img src="./imgs/expectation.png" width="70%"></a>
