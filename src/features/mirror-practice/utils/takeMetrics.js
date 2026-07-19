@@ -1,8 +1,19 @@
 import { tokenizeByWords } from "../../sentence-practice/utils/textAnalysis";
+import { countFillers } from "./fillerWords";
 
 // The hook samples the live microphone on this interval; every duration-based
 // metric below (pace, pauses, vocal variety) is derived from these frames.
 export const AUDIO_FRAME_INTERVAL_MS = 100;
+
+// Gaze samples arrive from the canvas render loop on this interval — sparse
+// enough that FaceLandmarker never competes with the 30fps compositing.
+export const GAZE_SAMPLE_INTERVAL_MS = 100;
+// A sample further than this from the take's median gaze point counts as
+// looking away. Shared by the post-take score and the live nudge so the two
+// always agree. ponytail: calibration knob, tune together with
+// EYE_RANGE_DEGREES in gazeTracker.js against real takes.
+export const GAZE_STEADY_RADIUS_DEGREES = 7;
+const MIN_GAZE_SAMPLES = 20;
 
 const MIN_PITCH_HZ = 60;
 const MAX_PITCH_HZ = 400;
@@ -203,7 +214,43 @@ function computePitchVarietySemitones(audioFrames, speechThreshold) {
   return Math.round(Math.sqrt(variance) * 10) / 10;
 }
 
-export function computeTakeMetrics({ transcriptEntries, languageCode, audioFrames, fallbackDurationSeconds }) {
+// Median gaze point of the take so far, or null while there are too few
+// samples to trust one. The median (not the mean) keeps a brief glance away
+// from dragging the anchor point with it.
+export function computeGazeMedian(gazeSamples) {
+  if (!gazeSamples || gazeSamples.length < MIN_GAZE_SAMPLES) {
+    return null;
+  }
+
+  const sortedX = gazeSamples.map((sample) => sample.x).sort((a, b) => a - b);
+  const sortedY = gazeSamples.map((sample) => sample.y).sort((a, b) => a - b);
+
+  return { x: percentile(sortedX, 0.5), y: percentile(sortedY, 0.5) };
+}
+
+export function isGazeOffPoint(sample, medianPoint) {
+  return Math.hypot(sample.x - medianPoint.x, sample.y - medianPoint.y) > GAZE_STEADY_RADIUS_DEGREES;
+}
+
+function computeGazeSteadiness(gazeSamples) {
+  const medianPoint = computeGazeMedian(gazeSamples);
+
+  if (!medianPoint) {
+    return null;
+  }
+
+  const steadyCount = gazeSamples.filter((sample) => !isGazeOffPoint(sample, medianPoint)).length;
+
+  return Math.round((steadyCount / gazeSamples.length) * 100);
+}
+
+export function computeTakeMetrics({
+  transcriptEntries,
+  languageCode,
+  audioFrames,
+  gazeSamples,
+  fallbackDurationSeconds,
+}) {
   const spokenText = (transcriptEntries ?? [])
     .map((entry) => entry.text)
     .join(" ")
@@ -243,6 +290,8 @@ export function computeTakeMetrics({ transcriptEntries, languageCode, audioFrame
     longestPauseSeconds: activity ? activity.longestPauseSeconds : null,
     clarityPercent,
     pitchVarietySemitones: activity ? computePitchVarietySemitones(audioFrames, activity.threshold) : null,
+    gazeSteadinessPercent: computeGazeSteadiness(gazeSamples ?? []),
+    fillerWordCount: countFillers(spokenText, languageCode),
   };
 }
 
@@ -261,13 +310,13 @@ export function describePace(summary) {
   if (paceValue < profile.goodMin) {
     return {
       tone,
-      caption: `${inWarnBand ? "A touch slow" : "Quite slow"} — aim for ${target}.`,
+      caption: `${inWarnBand ? "A touch slow" : "Quite slow"}. Aim for ${target}.`,
     };
   }
 
   return {
     tone,
-    caption: `${inWarnBand ? "A touch fast" : "Quite fast"} — aim for ${target}.`,
+    caption: `${inWarnBand ? "A touch fast" : "Quite fast"}. Aim for ${target}.`,
   };
 }
 
@@ -280,7 +329,7 @@ export function describePauses(summary) {
     return {
       tone: "good",
       value: "0",
-      caption: `No pauses over ${LONG_PAUSE_SECONDS}s — you kept your momentum.`,
+      caption: `No pauses over ${LONG_PAUSE_SECONDS}s. You kept your momentum.`,
     };
   }
 
@@ -290,7 +339,7 @@ export function describePauses(summary) {
   return {
     tone,
     value: String(summary.pauseCount),
-    caption: `Over ${LONG_PAUSE_SECONDS}s each — longest ${summary.longestPauseSeconds}s. Keep momentum through transitions.`,
+    caption: `Over ${LONG_PAUSE_SECONDS}s each, the longest ${summary.longestPauseSeconds}s. Keep momentum through transitions.`,
   };
 }
 
@@ -304,7 +353,7 @@ export function describeClarity(summary) {
   return {
     tone,
     value: `${summary.clarityPercent}%`,
-    caption: "How confidently speech recognition understood you — higher means clearer enunciation.",
+    caption: "How confidently speech recognition understood you. Higher means clearer enunciation.",
   };
 }
 
@@ -321,7 +370,45 @@ export function describePitchVariety(summary) {
   return {
     tone,
     value,
-    caption: `Pitch spread of ${semitones} semitones across the take — variation keeps listeners engaged.`,
+    caption: `Pitch spread of ${semitones} semitones across the take. Variation keeps listeners engaged.`,
+  };
+}
+
+export function describeGazeSteadiness(summary) {
+  const percent = summary.gazeSteadinessPercent;
+
+  if (percent == null) {
+    return { tone: "neutral", value: "—", caption: "Eye contact was not measured for this take." };
+  }
+
+  const tone = percent >= 80 ? "good" : percent >= 60 ? "warn" : "risk";
+
+  return {
+    tone,
+    value: `${percent}%`,
+    caption: `You held one focal point for ${percent}% of the take. Steady eye contact reads as confidence.`,
+  };
+}
+
+export function describeFillers(summary) {
+  const count = summary.fillerWordCount;
+
+  if (count == null) {
+    return { tone: "neutral", value: "—", caption: "Filler-word spotting is not available for this language yet." };
+  }
+
+  if (count === 0) {
+    return { tone: "good", value: "0", caption: "No filler words caught. Clean, purposeful wording." };
+  }
+
+  const perMinute = count / Math.max(summary.durationSeconds / 60, 1 / 60);
+  const tone = perMinute <= 2 ? "good" : perMinute <= 5 ? "warn" : "risk";
+
+  return {
+    tone,
+    value: String(count),
+    caption:
+      "Filler words and phrases caught by recognition. Open the transcript review to see them highlighted.",
   };
 }
 
@@ -344,11 +431,23 @@ export function buildCoachHint(summary) {
     return "Focus on clarity next take: finish word endings and keep a steady distance from the microphone.";
   }
 
+  const gaze = describeGazeSteadiness(summary);
+
+  if (gaze.tone === "warn" || gaze.tone === "risk") {
+    return "Anchor your eyes next take: pick one point at camera height and keep returning to it. Wandering eyes read as nerves.";
+  }
+
+  const fillers = describeFillers(summary);
+
+  if (fillers.tone === "warn" || fillers.tone === "risk") {
+    return `Trim the fillers next take: ${summary.fillerWordCount} caught. Pause silently instead of bridging with "um" or "you know".`;
+  }
+
   const variety = describePitchVariety(summary);
 
   if (variety.tone === "warn" || variety.tone === "risk") {
-    return "Add vocal variety next take: lift key words and let your pitch move — flat delivery loses listeners.";
+    return "Add vocal variety next take: lift key words and let your pitch move. Flat delivery loses listeners.";
   }
 
-  return "Strong take — pace, momentum, clarity, and tone are all on track. Record another to keep the trend moving.";
+  return "Strong take: pace, momentum, clarity, and tone are all on track. Record another to keep the trend moving.";
 }

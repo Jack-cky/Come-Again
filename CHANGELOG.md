@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.0.3] - 2026-07-19
+
+Deeper self-review for Mirror Practice with eye-contact tracking and a post-take review studio.
+
+### Added
+- Added eye-contact tracking with a live "keep your eyes on one point" nudge, plus a microphone level indicator and no-sound warning whilst recording.
+- Added a post-take review studio with replay, auditory, visual, and transcript review, plus a trends table for pace, pauses, clarity, eye contact, and fillers.
+- Added filler-word highlighting and counts, plus AI script suggestions that apply transcript corrections in place with coach summary, change list, hover explanations, and improved/original toggles. Shown only when a Gemini API key was provided at build time.
+- Added a "Practise corrections" button that sends AI-corrected sentences to Sentence Practice as a part-by-part practice queue, and added "Practise in parts" for drilling any long passage sentence by sentence.
+- Added a "Last time's advice" reminder before recording, recalling the AI coach summary from your previous take in the same language.
+- Added a clear history button to the recent takes table, with a two-step confirm before the stored takes are removed.
+
+### Changed
+- Moved the delivery metrics and coach tip from the sidebar into a full-width strip in the review studio, updated Mirror Practice guidance to welcome impromptu speaking, and routed AI corrections through a Cloudflare Worker proxy when configured.
+- The face-tracking model (~9 MB) downloads lazily from a CDN on supported browsers; when unavailable, takes work as before and eye contact shows as not measured.
+
 ## [1.0.2] - 2026-07-05
 
 Broader speaking-practice polish with better playback handling and a refreshed interface.

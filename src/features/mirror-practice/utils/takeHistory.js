@@ -37,6 +37,37 @@ export function findLatestTakeForLanguage(history, languageCode) {
   return null;
 }
 
+export function clearTakeHistory() {
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // Storage may be blocked; take history is best-effort.
+  }
+}
+
+// Attaches the AI coach summary to an already-saved take: takes are saved
+// the moment the session stops, but the summary only exists if the learner
+// later requests AI suggestions for that take.
+export function attachAiSummaryToTake(recordedAt, aiSummary) {
+  if (typeof localStorage === "undefined" || !recordedAt || !aiSummary) {
+    return;
+  }
+
+  try {
+    const history = loadTakeHistory();
+    const entry = history.find((take) => take.recordedAt === recordedAt);
+
+    if (!entry) {
+      return;
+    }
+
+    entry.aiSummary = aiSummary;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(history));
+  } catch {
+    // Storage may be full or blocked; take history is best-effort.
+  }
+}
+
 export function saveTakeToHistory(summary, history = loadTakeHistory()) {
   if (typeof localStorage === "undefined") {
     return;

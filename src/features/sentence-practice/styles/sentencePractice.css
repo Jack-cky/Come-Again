@@ -19,6 +19,23 @@
   background: var(--surface-muted);
 }
 
+/* Sentence-by-sentence practice controls for long passages. */
+.parts-stepper {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  border-bottom: 1px dashed var(--border);
+  padding: 0.55rem 1.1rem;
+}
+
+.parts-stepper-label {
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
 .source-row-label {
   color: var(--muted);
   font-size: 0.8rem;

@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   build:
+    environment: github-pages
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -37,6 +38,8 @@ jobs:
 
       - name: Build site
         run: npm run build
+        env:
+          VITE_GEMINI_PROXY_URL: ${{ vars.VITE_GEMINI_PROXY_URL }}
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v5

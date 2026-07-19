@@ -89,7 +89,11 @@ export default function App() {
       </header>
       <div id={`mode-panel-${activeMode}`} role="tabpanel" aria-labelledby={`mode-tab-${activeMode}`}>
         <ErrorBoundary key={activeMode}>
-          {activeMode === "mirror" ? <MirrorPracticePage /> : <SentencePracticePage />}
+          {activeMode === "mirror" ? (
+            <MirrorPracticePage onPractiseScript={() => activateMode("sentence")} />
+          ) : (
+            <SentencePracticePage />
+          )}
         </ErrorBoundary>
       </div>
     </div>

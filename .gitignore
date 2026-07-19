@@ -22,4 +22,7 @@ pnpm-debug.log*
 .parcel-cache/
 .vite/
 
+./claude
+CLAUDE.md
+
 imgs/sources/

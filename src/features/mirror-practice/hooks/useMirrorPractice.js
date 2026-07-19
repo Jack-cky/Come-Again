@@ -8,8 +8,16 @@ import {
   NON_BLOCKING_RECOGNITION_ERRORS,
 } from "../../../shared/speechRecognition";
 import { appendCaptionText, buildCaptionLines } from "../utils/captionLines";
-import { AUDIO_FRAME_INTERVAL_MS, computeTakeMetrics, measureAudioFrame } from "../utils/takeMetrics";
+import {
+  AUDIO_FRAME_INTERVAL_MS,
+  computeGazeMedian,
+  computeTakeMetrics,
+  GAZE_SAMPLE_INTERVAL_MS,
+  isGazeOffPoint,
+  measureAudioFrame,
+} from "../utils/takeMetrics";
 import { findLatestTakeForLanguage, loadTakeHistory, saveTakeToHistory } from "../utils/takeHistory";
+import { computeGazeAngles, loadGazeLandmarker } from "../services/gazeTracker";
 
 const DEFAULT_CAPTION_TEXT = "Your live transcript appears here whilst you speak.";
 const PREFERRED_VIDEO_MIME_TYPES = [
@@ -23,6 +31,16 @@ const DEFAULT_VIDEO_HEIGHT = 720;
 const COMPOSED_FRAME_RATE = 30;
 const FINAL_SUBTITLE_HOLD_MS = 5200;
 const INTERIM_SUBTITLE_THROTTLE_MS = 600;
+// The live "look back at your point" nudge appears after this long off-point
+// and clears this long after the eyes return, so a blink or a darting glance
+// never flashes the hint.
+const GAZE_NUDGE_AFTER_MS = 1000;
+const GAZE_NUDGE_CLEAR_MS = 500;
+// Live mic indicator: RMS thresholds for the 5-step level bar (the first
+// matches analyzeSpeechActivity's silence floor), and how many audio frames
+// of pure silence before warning that the microphone hears nothing.
+const MIC_LEVEL_THRESHOLDS = [0.006, 0.015, 0.03, 0.06, 0.12];
+const MIC_SILENT_AFTER_FRAMES = 50;
 
 function isDesktopChromeOrEdgeBrowser() {
   if (typeof navigator === "undefined") {
@@ -204,6 +222,9 @@ export default function useMirrorPractice(defaultLanguage) {
   const [transcriptEntries, setTranscriptEntries] = useState([]);
   const [takeMetrics, setTakeMetrics] = useState(null);
   const [previousTakeMetrics, setPreviousTakeMetrics] = useState(null);
+  const [isGazeWandering, setIsGazeWandering] = useState(false);
+  const [micLevel, setMicLevel] = useState(0);
+  const [isMicSilent, setIsMicSilent] = useState(false);
 
   const previewVideoRef = useRef(null);
   const recognitionRef = useRef(null);
@@ -246,6 +267,23 @@ export default function useMirrorPractice(defaultLanguage) {
   // Set by the error paths that end a take (recorder failure, fatal
   // recognition error) so stopSession skips saving a broken take to history.
   const sessionFailedRef = useRef(false);
+  // MediaPipe FaceLandmarker once loaded; gaze tracking silently stays off
+  // until then. One { x, y } gaze angle (degrees) per GAZE_SAMPLE_INTERVAL_MS
+  // across the take, no-face frames skipped.
+  const gazeLandmarkerRef = useRef(null);
+  const gazeSamplesRef = useRef([]);
+  const lastGazeSampleMsRef = useRef(0);
+  // Streak timestamps plus a state mirror so the render loop only calls
+  // setIsGazeWandering on transitions, not per sample.
+  const gazeOffPointSinceMsRef = useRef(0);
+  const gazeOnPointSinceMsRef = useRef(0);
+  const gazeWanderingRef = useRef(false);
+  // State mirrors for the live mic indicator so the audio interval only
+  // calls setState on transitions, not every 100ms frame.
+  const micLevelRef = useRef(0);
+  const micHeardRef = useRef(false);
+  const micSilentRef = useRef(false);
+  const micFrameCountRef = useRef(0);
 
   const attachPreviewStream = useCallback((stream) => {
     const video = previewVideoRef.current;
@@ -415,7 +453,45 @@ export default function useMirrorPractice(defaultLanguage) {
     recordingCanvasRef.current = null;
   }, [stopCanvasRenderer]);
 
+  const resetMicIndicator = useCallback(() => {
+    micLevelRef.current = 0;
+    micHeardRef.current = false;
+    micSilentRef.current = false;
+    micFrameCountRef.current = 0;
+    setMicLevel(0);
+    setIsMicSilent(false);
+  }, []);
+
+  const updateMicIndicator = useCallback((rms) => {
+    const level = MIC_LEVEL_THRESHOLDS.filter((threshold) => rms >= threshold).length;
+
+    if (level !== micLevelRef.current) {
+      micLevelRef.current = level;
+      setMicLevel(level);
+    }
+
+    if (level > 0) {
+      micHeardRef.current = true;
+
+      if (micSilentRef.current) {
+        micSilentRef.current = false;
+        setIsMicSilent(false);
+      }
+
+      return;
+    }
+
+    micFrameCountRef.current += 1;
+
+    if (!micHeardRef.current && !micSilentRef.current && micFrameCountRef.current >= MIC_SILENT_AFTER_FRAMES) {
+      micSilentRef.current = true;
+      setIsMicSilent(true);
+    }
+  }, []);
+
   const stopAudioAnalysis = useCallback(() => {
+    resetMicIndicator();
+
     const analysis = audioAnalysisRef.current;
 
     if (!analysis) {
@@ -432,7 +508,7 @@ export default function useMirrorPractice(defaultLanguage) {
 
     analysis.audioContext.close().catch(() => undefined);
     audioAnalysisRef.current = null;
-  }, []);
+  }, [resetMicIndicator]);
 
   // Taps the microphone track for loudness and pitch samples that feed the
   // post-take delivery metrics. Best-effort: a failure here must never block
@@ -457,7 +533,9 @@ export default function useMirrorPractice(defaultLanguage) {
         const sampleBuffer = new Float32Array(analyser.fftSize);
         const intervalId = window.setInterval(() => {
           analyser.getFloatTimeDomainData(sampleBuffer);
-          audioFramesRef.current.push(measureAudioFrame(sampleBuffer, audioContext.sampleRate));
+          const frame = measureAudioFrame(sampleBuffer, audioContext.sampleRate);
+          audioFramesRef.current.push(frame);
+          updateMicIndicator(frame.rms);
         }, AUDIO_FRAME_INTERVAL_MS);
 
         audioAnalysisRef.current = { audioContext, sourceNode, intervalId };
@@ -465,7 +543,7 @@ export default function useMirrorPractice(defaultLanguage) {
         audioAnalysisRef.current = null;
       }
     },
-    [stopAudioAnalysis],
+    [stopAudioAnalysis, updateMicIndicator],
   );
 
   // Analysis samples the microphone track, so it must never outlive the
@@ -590,6 +668,78 @@ export default function useMirrorPractice(defaultLanguage) {
     }
   }, []);
 
+  const resetGazeTracking = useCallback(() => {
+    gazeSamplesRef.current = [];
+    lastGazeSampleMsRef.current = 0;
+    gazeOffPointSinceMsRef.current = 0;
+    gazeOnPointSinceMsRef.current = 0;
+    gazeWanderingRef.current = false;
+    setIsGazeWandering(false);
+  }, []);
+
+  const updateGazeNudge = useCallback((angles, medianPoint, nowMs) => {
+    const offPoint = Boolean(angles && medianPoint && isGazeOffPoint(angles, medianPoint));
+
+    if (offPoint) {
+      gazeOnPointSinceMsRef.current = 0;
+
+      if (!gazeOffPointSinceMsRef.current) {
+        gazeOffPointSinceMsRef.current = nowMs;
+      }
+
+      if (!gazeWanderingRef.current && nowMs - gazeOffPointSinceMsRef.current >= GAZE_NUDGE_AFTER_MS) {
+        gazeWanderingRef.current = true;
+        setIsGazeWandering(true);
+      }
+
+      return;
+    }
+
+    gazeOffPointSinceMsRef.current = 0;
+
+    if (!gazeOnPointSinceMsRef.current) {
+      gazeOnPointSinceMsRef.current = nowMs;
+    }
+
+    if (gazeWanderingRef.current && nowMs - gazeOnPointSinceMsRef.current >= GAZE_NUDGE_CLEAR_MS) {
+      gazeWanderingRef.current = false;
+      setIsGazeWandering(false);
+    }
+  }, []);
+
+  // Called from the canvas render loop; throttled well below the frame rate
+  // so FaceLandmarker never competes with the 30fps compositing. Best-effort:
+  // a failure here must never break the recording.
+  const trackGazeFrame = useCallback(
+    (sourceVideo) => {
+      const landmarker = gazeLandmarkerRef.current;
+      const nowMs = performance.now();
+
+      if (!landmarker || nowMs - lastGazeSampleMsRef.current < GAZE_SAMPLE_INTERVAL_MS) {
+        return;
+      }
+
+      lastGazeSampleMsRef.current = nowMs;
+
+      try {
+        const angles = computeGazeAngles(landmarker.detectForVideo(sourceVideo, nowMs));
+        // The nudge compares against the median of the take so far.
+        // ponytail: full re-sort per sample; ~2k samples at 10Hz is trivial,
+        // switch to an incremental median if takes ever run much longer.
+        const medianPoint = computeGazeMedian(gazeSamplesRef.current);
+
+        if (angles) {
+          gazeSamplesRef.current.push(angles);
+        }
+
+        updateGazeNudge(angles, medianPoint, nowMs);
+      } catch {
+        // Gaze tracking is optional; the take carries on without it.
+      }
+    },
+    [updateGazeNudge],
+  );
+
   const startCanvasRenderer = useCallback(() => {
     const canvas = recordingCanvasRef.current;
     const sourceVideo = sourceVideoRef.current;
@@ -618,13 +768,15 @@ export default function useMirrorPractice(defaultLanguage) {
         if (subtitleLines.length) {
           drawSubtitleFrame(context, canvas.width, canvas.height, subtitleLines);
         }
+
+        trackGazeFrame(sourceVideo);
       }
 
       renderFrameIdRef.current = window.requestAnimationFrame(renderFrame);
     };
 
     renderFrameIdRef.current = window.requestAnimationFrame(renderFrame);
-  }, [drawSubtitleFrame, getBurnedSubtitleLines]);
+  }, [drawSubtitleFrame, getBurnedSubtitleLines, trackGazeFrame]);
 
   const stopSession = useCallback(() => {
     const wasActiveTake = isSessionActiveRef.current;
@@ -643,6 +795,10 @@ export default function useMirrorPractice(defaultLanguage) {
     lastInterimSubtitlePaintAtRef.current = 0;
     safelyStopRecognition();
     stopAudioAnalysis();
+    gazeWanderingRef.current = false;
+    gazeOffPointSinceMsRef.current = 0;
+    gazeOnPointSinceMsRef.current = 0;
+    setIsGazeWandering(false);
 
     // Compute and persist metrics once per take, and only for takes the user
     // ended themselves — error-terminated takes would pollute the
@@ -654,6 +810,7 @@ export default function useMirrorPractice(defaultLanguage) {
         transcriptEntries: transcriptEntriesRef.current,
         languageCode: sessionLanguageRef.current,
         audioFrames: audioFramesRef.current,
+        gazeSamples: gazeSamplesRef.current,
         fallbackDurationSeconds: sessionStartMsRef.current
           ? (Date.now() - sessionStartMsRef.current) / 1000
           : 0,
@@ -708,6 +865,7 @@ export default function useMirrorPractice(defaultLanguage) {
     captionLinesRef.current = [];
     transcriptEntriesRef.current = [];
     audioFramesRef.current = [];
+    resetGazeTracking();
     setTranscriptEntries([]);
     setTakeMetrics(null);
     setPreviousTakeMetrics(null);
@@ -723,13 +881,129 @@ export default function useMirrorPractice(defaultLanguage) {
     clearSubtitleHideTimer,
     isRecording,
     releaseMediaStream,
+    resetGazeTracking,
     revokeRecordingUrl,
     safelyStopRecognition,
     stopElapsedTimer,
   ]);
 
+  // Each take gets a freshly created recognition instance: Chrome delivers
+  // only empty final transcripts when an instance is started again after the
+  // microphone stream from its previous session has been stopped. Same
+  // pattern as sentence practice's initializeRecognition.
+  const initializeRecognition = useCallback(() => {
+    if (!recognitionClass) {
+      recognitionRef.current = null;
+      return;
+    }
+
+    try {
+      const oldRecognition = recognitionRef.current;
+
+      if (oldRecognition) {
+        oldRecognition.onresult = null;
+        oldRecognition.onerror = null;
+        oldRecognition.onend = null;
+        oldRecognition.stop();
+      }
+    } catch {
+      // Ignore InvalidStateError when the old instance is already stopped.
+    }
+
+    const recognition = createConfiguredRecognition(recognitionClass);
+    recognitionRef.current = recognition;
+
+    recognition.onresult = (event) => {
+      // Results finalised after Stop are ignored so the downloaded transcript
+      // always matches the metrics computed at the moment the take ended.
+      if (userStoppedRecognitionRef.current) {
+        return;
+      }
+
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        const transcript = result[0]?.transcript ?? "";
+
+        if (result.isFinal) {
+          appendTranscriptText(transcript, result[0]?.confidence);
+          clearInterimSubtitleFlushTimer();
+          interimSubtitleRef.current = "";
+          pendingInterimSubtitleRef.current = "";
+          lastInterimSubtitlePaintAtRef.current = 0;
+          captionBufferRef.current = appendCaptionText(captionBufferRef.current, transcript);
+          const nextCaptionLines = buildCaptionLines(captionBufferRef.current);
+          // Keep only the visible lines (with their breaks committed) so the
+          // buffer stays small and existing lines never re-wrap.
+          captionBufferRef.current = nextCaptionLines.join("\n");
+          showSubtitleThenHide(nextCaptionLines);
+        } else {
+          showInterimSubtitle(transcript.trim());
+        }
+      }
+    };
+
+    recognition.onerror = (event) => {
+      if (userStoppedRecognitionRef.current) {
+        return;
+      }
+
+      if (NON_BLOCKING_RECOGNITION_ERRORS.has(event.error)) {
+        clearInterimSubtitleFlushTimer();
+        interimSubtitleRef.current = "";
+        pendingInterimSubtitleRef.current = "";
+        lastInterimSubtitlePaintAtRef.current = 0;
+        showSubtitleThenHide(buildCaptionLines(captionBufferRef.current));
+        return;
+      }
+
+      setErrorMessage(`Recognition error: ${event.error}. Your session has ended.`);
+
+      if (FATAL_RECOGNITION_ERRORS.has(event.error)) {
+        sessionFailedRef.current = true;
+        stopSession();
+      }
+    };
+
+    recognition.onend = () => {
+      if (!userStoppedRecognitionRef.current && isSessionActiveRef.current) {
+        clearRecognitionRestart();
+        restartTimeoutRef.current = window.setTimeout(() => {
+          if (
+            userStoppedRecognitionRef.current ||
+            recognitionRef.current !== recognition ||
+            !isSessionActiveRef.current
+          ) {
+            return;
+          }
+
+          try {
+            recognition.start();
+          } catch {
+            sessionFailedRef.current = true;
+            setErrorMessage("Live transcription stopped unexpectedly. Your session has ended.");
+            stopSession();
+          }
+        }, 250);
+      }
+    };
+  }, [
+    appendTranscriptText,
+    clearRecognitionRestart,
+    clearInterimSubtitleFlushTimer,
+    recognitionClass,
+    showInterimSubtitle,
+    showSubtitleThenHide,
+    stopSession,
+  ]);
+
   const startSession = useCallback(async () => {
-    if (!isSupported || !recognitionRef.current || isRecording || hasCompletedTake) {
+    if (!isSupported || isRecording || hasCompletedTake) {
+      return;
+    }
+
+    initializeRecognition();
+
+    if (!recognitionRef.current) {
       return;
     }
 
@@ -749,6 +1023,7 @@ export default function useMirrorPractice(defaultLanguage) {
     captionBufferRef.current = "";
     transcriptEntriesRef.current = [];
     audioFramesRef.current = [];
+    resetGazeTracking();
     applyCaptionLines([]);
     setTranscriptEntries([]);
     setTakeMetrics(null);
@@ -886,9 +1161,11 @@ export default function useMirrorPractice(defaultLanguage) {
     clearInterimSubtitleFlushTimer,
     clearSubtitleHideTimer,
     hasCompletedTake,
+    initializeRecognition,
     isRecording,
     isSupported,
     releaseMediaStream,
+    resetGazeTracking,
     revokeRecordingUrl,
     safelyStopRecognition,
     selectedLanguage,
@@ -901,87 +1178,36 @@ export default function useMirrorPractice(defaultLanguage) {
     updateElapsed,
   ]);
 
+  // Kick off the FaceLandmarker download (~9 MB WASM + model from CDNs) as
+  // soon as the page mounts on a supported browser, so gaze tracking is ready
+  // from the first take. Failure is silent: every other part of the take
+  // works without it and the metric card shows "not measured".
   useEffect(() => {
     if (!isSupported) {
       return undefined;
     }
 
-    const recognition = createConfiguredRecognition(recognitionClass);
-    recognitionRef.current = recognition;
+    let cancelled = false;
 
-    recognition.onresult = (event) => {
-      // Results finalised after Stop are ignored so the downloaded transcript
-      // always matches the metrics computed at the moment the take ended.
-      if (userStoppedRecognitionRef.current) {
-        return;
-      }
-
-      for (let index = event.resultIndex; index < event.results.length; index += 1) {
-        const result = event.results[index];
-        const transcript = result[0]?.transcript ?? "";
-
-        if (result.isFinal) {
-          appendTranscriptText(transcript, result[0]?.confidence);
-          clearInterimSubtitleFlushTimer();
-          interimSubtitleRef.current = "";
-          pendingInterimSubtitleRef.current = "";
-          lastInterimSubtitlePaintAtRef.current = 0;
-          captionBufferRef.current = appendCaptionText(captionBufferRef.current, transcript);
-          const nextCaptionLines = buildCaptionLines(captionBufferRef.current);
-          // Keep only the visible lines (with their breaks committed) so the
-          // buffer stays small and existing lines never re-wrap.
-          captionBufferRef.current = nextCaptionLines.join("\n");
-          showSubtitleThenHide(nextCaptionLines);
-        } else {
-          showInterimSubtitle(transcript.trim());
+    loadGazeLandmarker()
+      .then((landmarker) => {
+        if (!cancelled) {
+          gazeLandmarkerRef.current = landmarker;
         }
-      }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
     };
+  }, [isSupported]);
 
-    recognition.onerror = (event) => {
-      if (userStoppedRecognitionRef.current) {
-        return;
-      }
+  useEffect(() => {
+    if (!isSupported) {
+      return undefined;
+    }
 
-      if (NON_BLOCKING_RECOGNITION_ERRORS.has(event.error)) {
-        clearInterimSubtitleFlushTimer();
-        interimSubtitleRef.current = "";
-        pendingInterimSubtitleRef.current = "";
-        lastInterimSubtitlePaintAtRef.current = 0;
-        showSubtitleThenHide(buildCaptionLines(captionBufferRef.current));
-        return;
-      }
-
-      setErrorMessage(`Recognition error: ${event.error}. Your session has ended.`);
-
-      if (FATAL_RECOGNITION_ERRORS.has(event.error)) {
-        sessionFailedRef.current = true;
-        stopSession();
-      }
-    };
-
-    recognition.onend = () => {
-      if (!userStoppedRecognitionRef.current && isSessionActiveRef.current) {
-        clearRecognitionRestart();
-        restartTimeoutRef.current = window.setTimeout(() => {
-          if (
-            userStoppedRecognitionRef.current ||
-            recognitionRef.current !== recognition ||
-            !isSessionActiveRef.current
-          ) {
-            return;
-          }
-
-          try {
-            recognition.start();
-          } catch {
-            sessionFailedRef.current = true;
-            setErrorMessage("Live transcription stopped unexpectedly. Your session has ended.");
-            stopSession();
-          }
-        }, 250);
-      }
-    };
+    initializeRecognition();
 
     return () => {
       clearRecognitionRestart();
@@ -993,16 +1219,12 @@ export default function useMirrorPractice(defaultLanguage) {
       recognitionRef.current = null;
     };
   }, [
-    appendTranscriptText,
     clearRecognitionRestart,
     clearInterimSubtitleFlushTimer,
     clearSubtitleHideTimer,
+    initializeRecognition,
     isSupported,
-    recognitionClass,
-    showInterimSubtitle,
     safelyStopRecognition,
-    showSubtitleThenHide,
-    stopSession,
   ]);
 
   useEffect(() => {
@@ -1047,6 +1269,9 @@ export default function useMirrorPractice(defaultLanguage) {
     transcriptEntries,
     takeMetrics,
     previousTakeMetrics,
+    isGazeWandering,
+    micLevel,
+    isMicSilent,
     previewVideoRef,
     startSession,
     stopSession,

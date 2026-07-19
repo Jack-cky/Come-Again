@@ -23,7 +23,7 @@ export default class ErrorBoundary extends Component {
       return (
         <div className="alert error-boundary" role="alert">
           <p>
-            <strong>Something went wrong.</strong> The page hit an unexpected error — reloading usually fixes
+            <strong>Something went wrong.</strong> The page hit an unexpected error. Reloading usually fixes
             it.
           </p>
           <button className="btn btn-primary" type="button" onClick={this.handleReload}>

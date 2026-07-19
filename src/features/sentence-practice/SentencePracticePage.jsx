@@ -9,6 +9,13 @@ import {
   fetchWikipediaPassage,
 } from "./services/passageSources";
 import { buildTranscriptSegments, resolveTranscriptMode } from "./utils/textAnalysis";
+import { consumePracticeHandoff } from "../../shared/practiceHandoff";
+import splitSentences from "../../shared/splitSentences";
+
+// A passage this long with at least this many sentences offers "practise in
+// parts" so it can be drilled sentence by sentence.
+const PARTS_MIN_CHARS = 200;
+const PARTS_MIN_SENTENCES = 3;
 
 const PASSAGE_SOURCES = [
   {
@@ -41,6 +48,9 @@ export default function SentencePracticePage() {
     loadingId: null,
     message: "",
   });
+  // Sentence-by-sentence practice over a long passage:
+  // { parts, index, fullText } while active, null otherwise.
+  const [practiceParts, setPracticeParts] = useState(null);
   const defaultLanguage = useMemo(() => getPreferredLanguage(), []);
 
   const {
@@ -82,6 +92,80 @@ export default function SentencePracticePage() {
     };
   }, []);
 
+  // Corrected lines handed over from Mirror Practice's AI suggestions become
+  // a sentence-by-sentence practice queue. Consumed once, on mount.
+  useEffect(() => {
+    const handoff = consumePracticeHandoff();
+
+    if (!handoff) {
+      return;
+    }
+
+    setPracticeParts({ parts: handoff.parts, index: 0, fullText: handoff.parts.join(" ") });
+    setReferenceText(handoff.parts[0]);
+    setReferenceSource({ provider: "Mirror Practice", title: "Corrected lines from your take", url: "" });
+    setReferenceLoadState({
+      isLoading: false,
+      loadingId: null,
+      message:
+        handoff.parts.length > 1
+          ? `Loaded ${handoff.parts.length} corrected lines from Mirror Practice. Drill them one at a time.`
+          : "Loaded your corrected line from Mirror Practice.",
+    });
+
+    if (typeof handoff.languageCode === "string" && handoff.languageCode) {
+      setSelectedLanguage(handoff.languageCode);
+    }
+    // Mount-only by design: the handoff is a one-shot read.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const goToPart = (index) => {
+    if (!practiceParts || index < 0 || index >= practiceParts.parts.length) {
+      return;
+    }
+
+    if (!isListening) {
+      resetSession();
+    }
+
+    setPracticeParts({ ...practiceParts, index });
+    setReferenceText(practiceParts.parts[index]);
+  };
+
+  const enterPartsMode = () => {
+    const parts = splitSentences(referenceText);
+
+    if (parts.length < 2) {
+      return;
+    }
+
+    if (!isListening) {
+      resetSession();
+    }
+
+    setPracticeParts({ parts, index: 0, fullText: referenceText });
+    setReferenceText(parts[0]);
+  };
+
+  const exitPartsMode = () => {
+    if (!practiceParts) {
+      return;
+    }
+
+    if (!isListening) {
+      resetSession();
+    }
+
+    setReferenceText(practiceParts.fullText);
+    setPracticeParts(null);
+  };
+
+  const canPractiseInParts =
+    !practiceParts &&
+    referenceText.length > PARTS_MIN_CHARS &&
+    splitSentences(referenceText).length >= PARTS_MIN_SENTENCES;
+
   const loadPassage = async (source) => {
     setReferenceLoadState({
       isLoading: true,
@@ -97,6 +181,9 @@ export default function SentencePracticePage() {
     }
 
     setReferenceText(payload.passage);
+    // A freshly loaded passage replaces any active parts queue; keeping the
+    // stepper alive would let Previous/Next revert to the stale parts.
+    setPracticeParts(null);
     setReferenceSource({
       provider: payload.provider ?? source.title,
       title: payload.title ?? source.title,
@@ -196,7 +283,7 @@ export default function SentencePracticePage() {
     } else if (hasUserStopped) {
       workflowGuide = "Review your transcript above, or press Start Over to try another passage.";
     } else if (referenceText.trim()) {
-      workflowGuide = "You're all set — press Record and read the passage aloud.";
+      workflowGuide = "You're all set. Press Record and read the passage aloud.";
     } else {
       workflowGuide = "Load or paste a passage first, then press Record and read it aloud.";
     }
@@ -221,7 +308,7 @@ export default function SentencePracticePage() {
   } else if (!finalTranscript.trim()) {
     coachHint = referenceText.trim()
       ? "Speak in short, clear phrases. The level bar next to the Record button shows when your voice is picked up."
-      : "Load or paste the passage you want to practice — accuracy scores need something to compare against.";
+      : "Load or paste the passage you want to practice. Accuracy scores need something to compare against.";
   } else if (accuracy !== null && accuracy < 60) {
     coachHint =
       "Slow down and match the reference rhythm. Pause briefly between phrases for clearer recognition.";
@@ -333,10 +420,47 @@ export default function SentencePracticePage() {
               </>
             ) : (
               <span className="source-row-label">
-                No built-in passages for this language yet — paste your own text below.
+                No built-in passages for this language yet. Paste your own text below.
               </span>
             )}
           </div>
+          {practiceParts ? (
+            <div className="parts-stepper" role="group" aria-label="Practice parts">
+              <button
+                className="btn btn-ghost"
+                type="button"
+                disabled={practiceParts.index === 0}
+                onClick={() => goToPart(practiceParts.index - 1)}
+              >
+                <span aria-hidden="true">‹</span> Previous
+              </button>
+              <span className="parts-stepper-label" role="status" aria-live="polite">
+                Part {practiceParts.index + 1} of {practiceParts.parts.length}
+              </span>
+              <button
+                className="btn btn-ghost"
+                type="button"
+                disabled={practiceParts.index === practiceParts.parts.length - 1}
+                onClick={() => goToPart(practiceParts.index + 1)}
+              >
+                Next <span aria-hidden="true">›</span>
+              </button>
+              <button className="btn btn-ghost" type="button" onClick={exitPartsMode}>
+                Show full passage
+              </button>
+            </div>
+          ) : (
+            canPractiseInParts && (
+              <div className="parts-stepper">
+                <button className="btn btn-ghost" type="button" onClick={enterPartsMode}>
+                  <span aria-hidden="true">✂</span> Practise in parts
+                </button>
+                <span className="parts-stepper-label">
+                  Long passage? Drill it sentence by sentence.
+                </span>
+              </div>
+            )
+          )}
           <label className="sr-only" htmlFor="reference-text">
             Reference text
           </label>
@@ -346,6 +470,7 @@ export default function SentencePracticePage() {
             onChange={(event) => {
               setReferenceText(event.target.value);
               setReferenceSource(null);
+              setPracticeParts(null);
               setReferenceLoadState({ isLoading: false, loadingId: null, message: "" });
             }}
             placeholder="Paste any text you want to practice, or use Quick load above. Your speech will be scored against whatever is written here."
@@ -401,15 +526,15 @@ export default function SentencePracticePage() {
           </div>
           {phoneticsStatus === "loading" && (
             <div className="card-foot" role="status">
-              Preparing the Japanese reading dictionary — kanji and kana will be matched by pronunciation once
+              Preparing the Japanese reading dictionary. Kanji and kana will be matched by pronunciation once
               it loads (first use only).
             </div>
           )}
           {phoneticsStatus === "failed" && (
             <div className="card-foot" role="status">
-              The Japanese reading dictionary could not be downloaded, so matching uses kana folding only —
-              kanji and kana spellings of the same word may be flagged. Check your connection and reselect
-              Japanese to retry.
+              The Japanese reading dictionary could not be downloaded, so matching uses kana folding only,
+              and kanji and kana spellings of the same word may be flagged. Check your connection and
+              reselect Japanese to retry.
             </div>
           )}
           {hasHighlightedWords && referenceText.trim() && (
@@ -417,7 +542,7 @@ export default function SentencePracticePage() {
               <span className="legend-swatch" aria-hidden="true">
                 word
               </span>
-              Highlighted words were missed or mispronounced — click one to hear it pronounced correctly.
+              Highlighted words were missed or mispronounced. Click one to hear it pronounced correctly.
             </div>
           )}
         </section>

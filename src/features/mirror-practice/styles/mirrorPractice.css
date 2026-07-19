@@ -97,6 +97,43 @@
   backdrop-filter: blur(10px);
 }
 
+/* Live gaze nudge: a DOM-only overlay on the preview (never drawn onto the
+   recording canvas), so the hint is invisible in the saved clip. */
+.camera-gaze-hint {
+  position: absolute;
+  top: 3.4rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  padding: 0.42rem 0.85rem;
+  background: rgba(9, 14, 18, 0.68);
+  color: #fffaf0;
+  font-size: 0.82rem;
+  font-weight: 700;
+  white-space: nowrap;
+  box-shadow: 0 12px 24px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(10px);
+  animation: gaze-hint-in 0.25s ease;
+  pointer-events: none;
+}
+
+@keyframes gaze-hint-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-0.4rem);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
 /* YouTube-style roll-up captions: one chip per line, backgrounds hugging the
    text, anchored to a fixed left edge so words fill left to right without
    shifting. Every metric is a fraction of the video width (cqw) or of the
@@ -171,12 +208,203 @@
   font-weight: 800;
 }
 
+/* ---------- Post-take review studio ---------- */
+
+.review-body {
+  display: grid;
+  gap: 0.85rem;
+  padding: 0.95rem 1.1rem 1.1rem;
+}
+
+.review-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.review-prompt {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.review-transcript {
+  max-height: 16rem;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 0.85rem 1rem;
+  background: var(--surface-muted);
+}
+
+.review-transcript-entry {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.review-transcript-time {
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.review-transcript-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.filler-mark {
+  border-radius: 0.3em;
+  padding: 0.05em 0.25em;
+  background: color-mix(in srgb, var(--warn) 24%, transparent);
+  color: inherit;
+  font-weight: 700;
+}
+
+.review-listen-panel {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 0.8rem;
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 12px;
+  padding: 1rem;
+  background: linear-gradient(180deg, #102428, #1d3c41);
+  color: #fffaf0;
+  text-align: center;
+  box-shadow: 0 18px 34px rgba(23, 37, 38, 0.18);
+}
+
+.review-listen-panel p {
+  margin: 0;
+  font-size: 0.9rem;
+  opacity: 0.85;
+}
+
+.review-listen-icon {
+  font-size: 2.2rem;
+}
+
+.review-audio {
+  width: min(100%, 24rem);
+}
+
+/* Live mic level inside the duration pill. */
+.mic-level {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  margin-right: 0.55rem;
+}
+
+.mic-level-bar {
+  width: 3px;
+  border-radius: 1px;
+  background: rgba(255, 250, 240, 0.28);
+}
+
+.mic-level-bar:nth-child(1) { height: 5px; }
+.mic-level-bar:nth-child(2) { height: 8px; }
+.mic-level-bar:nth-child(3) { height: 11px; }
+.mic-level-bar:nth-child(4) { height: 14px; }
+.mic-level-bar:nth-child(5) { height: 17px; }
+
+.mic-level-bar.is-on {
+  background: var(--success);
+}
+
+.camera-mic-hint {
+  top: 6.2rem;
+}
+
+/* AI script suggestions inside the transcript review. Action buttons live at
+   the right end of the mode-tab row so the status text below stays a tight
+   single line, aligned with the other tabs' prompts. */
+.review-tab-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+.review-ai-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 0.85rem;
+}
+
+/* In-place corrections; green so they read as upgrades, unlike the amber
+   filler marks which flag problems. */
+.ai-mark {
+  border-radius: 0.3em;
+  padding: 0.05em 0.25em;
+  background: color-mix(in srgb, var(--success) 22%, transparent);
+  color: inherit;
+  font-weight: 700;
+  cursor: help;
+}
+
+.ai-mark:focus-visible {
+  outline: 2px solid var(--success);
+  outline-offset: 1px;
+}
+
+/* Once suggestions are applied, fillers read as "cut this". */
+.filler-mark.is-cut {
+  text-decoration: line-through;
+  opacity: 0.75;
+}
+
+.review-ai-legend {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.review-ai-summary {
+  display: flex;
+  gap: 0.45rem;
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.review-ai-details summary {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.review-ai-changes {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0.6rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.85rem;
+}
+
+.review-ai-change-pair {
+  display: block;
+}
+
+.review-ai-change-reason {
+  display: block;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
 /* ---------- Delivery metrics ---------- */
 
-.delivery-panel {
+.metric-strip {
   display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 0.7rem;
-  padding: 0.95rem 1.1rem;
 }
 
 .pace-hero {
@@ -235,6 +463,69 @@
 }
 
 .pace-hero.tone-risk .pace-value {
+  color: var(--danger);
+}
+
+/* ---------- Recent takes trends ---------- */
+
+.review-trends summary {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.review-trends-scroll {
+  overflow-x: auto;
+  margin-top: 0.6rem;
+}
+
+.review-trends table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.review-trends th,
+.review-trends td {
+  border-bottom: 1px solid var(--border);
+  padding: 0.4rem 0.7rem 0.4rem 0;
+  text-align: left;
+}
+
+.review-trends th {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.review-trends tr.is-latest td {
+  font-weight: 700;
+}
+
+.review-trends-foot {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.6rem;
+}
+
+.review-trends-foot .btn.is-danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.trend-arrow {
+  font-size: 0.72rem;
+}
+
+.trend-arrow.is-better {
+  color: var(--success);
+}
+
+.trend-arrow.is-worse {
   color: var(--danger);
 }
 
