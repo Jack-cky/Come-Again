@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { getPreferredLanguage, LANGUAGE_OPTIONS } from "../sentence-practice/constants/languages";
 import MetricCard from "../sentence-practice/components/MetricCard";
 import { formatTime } from "../../shared/speechRecognition";
@@ -92,13 +92,24 @@ const REVIEW_MODES = [
   {
     id: "transcript",
     label: "📝 Transcript",
-    // The transcript toolbar speaks for itself; no prompt line.
     prompt: "",
   },
 ];
 
 export default function MirrorPracticePage({ onPractiseScript }) {
   const defaultLanguage = useMemo(() => getPreferredLanguage(), []);
+  // Whichever <video>/<audio> is replaying the take; transcript timestamps seek it.
+  const playbackRef = useRef(null);
+  const seekPlayback = (seconds) => {
+    const media = playbackRef.current;
+
+    if (!media) {
+      return;
+    }
+
+    media.currentTime = seconds;
+    media.play().catch(() => {});
+  };
   const {
     isSupported,
     unsupportedMessage,
@@ -197,8 +208,6 @@ export default function MirrorPracticePage({ onPractiseScript }) {
   // whatever the select currently shows.
   const transcriptLanguage = takeMetrics?.languageCode ?? selectedLanguage;
   const showAiCoach = isTranscriptCoachAvailable() && transcriptEntries.length > 0;
-  // The transcript tab's status line lives in the same tight prompt slot as
-  // the other tabs' reflection prompts; its buttons sit in the tab row.
   const transcriptHint =
     reviewMode === "transcript" && showAiCoach
       ? aiSuggestion.status === "ready"
@@ -347,11 +356,12 @@ export default function MirrorPracticePage({ onPractiseScript }) {
                       🎧
                     </span>
                     <p>Listen without watching. Focus on your vocal image.</p>
-                    <audio className="review-audio" controls src={recordingUrl} />
+                    <audio ref={playbackRef} className="review-audio" controls src={recordingUrl} />
                   </div>
                 ) : (
                   <video
                     key="playback"
+                    ref={playbackRef}
                     className="camera-playback"
                     controls
                     muted={reviewMode === "muted"}
@@ -565,7 +575,14 @@ export default function MirrorPracticePage({ onPractiseScript }) {
                   {transcriptEntries.length ? (
                     transcriptEntries.map((entry, entryIndex) => (
                       <p key={entryIndex} className="review-transcript-entry">
-                        <span className="review-transcript-time">[{formatTime(entry.time)}]</span>{" "}
+                        <button
+                          type="button"
+                          className="review-transcript-time"
+                          onClick={() => seekPlayback(entry.time)}
+                          title="Jump to this point in the recording"
+                        >
+                          [{formatTime(entry.time)}]
+                        </button>{" "}
                         {annotatedEntries
                           ? annotatedEntries[entryIndex].map((segment, segmentIndex) =>
                               segment.change ? (

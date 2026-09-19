@@ -245,10 +245,21 @@
 }
 
 .review-transcript-time {
+  padding: 0;
+  border: 0;
+  background: none;
   color: var(--muted);
+  font: inherit;
   font-size: 0.76rem;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.review-transcript-time:hover,
+.review-transcript-time:focus-visible {
+  color: var(--accent);
+  text-decoration: underline;
 }
 
 .review-transcript-empty {

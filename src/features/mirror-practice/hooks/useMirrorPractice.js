@@ -12,6 +12,7 @@ import {
   AUDIO_FRAME_INTERVAL_MS,
   computeGazeMedian,
   computeTakeMetrics,
+  findSpeechOnsetMs,
   GAZE_SAMPLE_INTERVAL_MS,
   isGazeOffPoint,
   measureAudioFrame,
@@ -255,9 +256,11 @@ export default function useMirrorPractice(defaultLanguage) {
   // Mirror of the transcriptEntries state so stopSession can compute take
   // metrics synchronously without waiting for a state flush.
   const transcriptEntriesRef = useRef([]);
-  // Live audio analysis: { audioContext, sourceNode, intervalId }.
+  // Session-relative ms when the current utterance's first interim result
+  // arrived, so transcript entries are stamped where speech started rather
+  // than where recognition finalised it (that is what replay seeks to).
+  const utteranceStartMsRef = useRef(null);
   const audioAnalysisRef = useRef(null);
-  // One { rms, pitchHz } sample per AUDIO_FRAME_INTERVAL_MS across the take.
   const audioFramesRef = useRef([]);
   // The language recognition was started with. Metrics and history must use
   // this rather than selectedLanguage: the select stays enabled until
@@ -407,8 +410,7 @@ export default function useMirrorPractice(defaultLanguage) {
       }
 
       subtitleClearTimeoutRef.current = window.setTimeout(() => {
-        // After the hold expires the caption disappears; the next utterance
-        // starts a fresh roll-up instead of pulling old words back on screen.
+        // Cleared so the next utterance starts a fresh roll-up.
         captionBufferRef.current = "";
         applyCaptionLines([]);
         subtitleClearTimeoutRef.current = null;
@@ -583,10 +585,16 @@ export default function useMirrorPractice(defaultLanguage) {
       return;
     }
 
-    const elapsedSeconds = sessionStartMsRef.current
-      ? Math.max(0, Math.floor((Date.now() - sessionStartMsRef.current) / 1000))
-      : 0;
+    const interimMs = utteranceStartMsRef.current ?? (Date.now() - sessionStartMsRef.current);
+    const previousEntry = transcriptEntriesRef.current.at(-1);
+    const startMs = findSpeechOnsetMs(
+      audioFramesRef.current,
+      interimMs,
+      previousEntry ? previousEntry.time * 1000 : 0,
+    );
+    const elapsedSeconds = sessionStartMsRef.current ? Math.max(0, Math.floor(startMs / 1000)) : 0;
 
+    utteranceStartMsRef.current = null;
     transcriptEntriesRef.current = [
       ...transcriptEntriesRef.current,
       {
@@ -723,7 +731,6 @@ export default function useMirrorPractice(defaultLanguage) {
 
       try {
         const angles = computeGazeAngles(landmarker.detectForVideo(sourceVideo, nowMs));
-        // The nudge compares against the median of the take so far.
         // ponytail: full re-sort per sample; ~2k samples at 10Hz is trivial,
         // switch to an incremental median if takes ever run much longer.
         const medianPoint = computeGazeMedian(gazeSamplesRef.current);
@@ -734,7 +741,7 @@ export default function useMirrorPractice(defaultLanguage) {
 
         updateGazeNudge(angles, medianPoint, nowMs);
       } catch {
-        // Gaze tracking is optional; the take carries on without it.
+        // Best-effort, see above.
       }
     },
     [updateGazeNudge],
@@ -864,6 +871,7 @@ export default function useMirrorPractice(defaultLanguage) {
     captionBufferRef.current = "";
     captionLinesRef.current = [];
     transcriptEntriesRef.current = [];
+    utteranceStartMsRef.current = null;
     audioFramesRef.current = [];
     resetGazeTracking();
     setTranscriptEntries([]);
@@ -937,6 +945,7 @@ export default function useMirrorPractice(defaultLanguage) {
           captionBufferRef.current = nextCaptionLines.join("\n");
           showSubtitleThenHide(nextCaptionLines);
         } else {
+          utteranceStartMsRef.current ??= Date.now() - sessionStartMsRef.current;
           showInterimSubtitle(transcript.trim());
         }
       }
@@ -1022,6 +1031,7 @@ export default function useMirrorPractice(defaultLanguage) {
     lastInterimSubtitlePaintAtRef.current = 0;
     captionBufferRef.current = "";
     transcriptEntriesRef.current = [];
+    utteranceStartMsRef.current = null;
     audioFramesRef.current = [];
     resetGazeTracking();
     applyCaptionLines([]);
@@ -1178,10 +1188,9 @@ export default function useMirrorPractice(defaultLanguage) {
     updateElapsed,
   ]);
 
-  // Kick off the FaceLandmarker download (~9 MB WASM + model from CDNs) as
-  // soon as the page mounts on a supported browser, so gaze tracking is ready
-  // from the first take. Failure is silent: every other part of the take
-  // works without it and the metric card shows "not measured".
+  // Prefetch the FaceLandmarker (~9 MB from CDNs) on mount so gaze tracking
+  // is ready from the first take. Failure is silent: the metric card shows
+  // "not measured".
   useEffect(() => {
     if (!isSupported) {
       return undefined;

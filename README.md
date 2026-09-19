@@ -11,7 +11,7 @@ Meet Come Again, a free self-study app focused on pronunciation and built to giv
 <div align="right">
   <a href="https://jack-cky.github.io/Come-Again/"><img src="https://custom-icon-badges.demolab.com/badge/React-53c1de?logo=react&logoColor=fff"></a>
   <a href="https://docs.google.com/spreadsheets/d/1hZBngU6REh5M9iyUclPlf8IyO3Iz3ZVW1exo_-vM1ks/pubhtml?gid=436381785&single=true"><img src="https://custom-icon-badges.demolab.com/badge/Backlog-319E4F?logo=Google-Sheets&logoColor=fff"></a>
-  <p><strong>First Published:</strong> 18 June 2026<br><strong>Last Updated:</strong> 19 July 2026</p>
+  <p><strong>First Published:</strong> 18 June 2026<br><strong>Last Updated:</strong> 19 September 2026</p>
 </div>
 
 

@@ -1,7 +1,3 @@
-// Cloudflare Worker: Gemini proxy for Come Again. The API key lives here as
-// a Worker secret, so the static site never ships it. The model is set
-// server-side via the GEMINI_MODEL var, so a leaked Worker URL still cannot
-// be used against arbitrary models.
 const DEFAULT_MODEL = "gemini-2.5-flash";
 
 export default {
@@ -31,9 +27,6 @@ export default {
       return new Response("Method not allowed", { status: 405, headers: corsHeaders });
     }
 
-    // ponytail: no rate limiting; the free-tier Gemini quota is the cap and
-    // the Origin check keeps other websites out. Add a KV or Durable Object
-    // counter here if quota abuse ever shows up.
     const model = env.GEMINI_MODEL || DEFAULT_MODEL;
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
     const upstream = await fetch(geminiUrl, {

@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.0.4] - 2026-09-19
+
+Polished transcript replay and parts practice, with streamlined configuration and GitHub Pages deployment.
+
+### Fixed
+- Editing the reference text whilst practising in parts now updates the current part instead of discarding the whole parts queue.
+
+### Added
+- Added clickable transcript timestamps to the Mirror Practice review so replay jumps to where each line was spoken. Timestamps use the detected speech onset rather than when recognition finished.
+
+### Changed
+- Consolidated the GitHub Pages build and publish steps into a single workflow.
+- Moved Vite environment loading to the `config/` directory and updated the Gemini Worker model and local origin configuration.
+
 ## [1.0.3] - 2026-07-19
 
 Deeper self-review for Mirror Practice with eye-contact tracking and a post-take review studio.

@@ -30,10 +30,7 @@ const RESPONSE_SCHEMA = {
   required: ["revisedScript", "summary", "changes"],
 };
 
-// Preferred setup: VITE_GEMINI_PROXY_URL points at the Cloudflare Worker in
-// worker/, which holds the key server-side. A direct VITE_GEMINI_API_KEY
-// still works for local development but ships the key in the bundle (see
-// KNOWN_ISSUES.md). Optional chaining keeps these node-safe for the checks.
+// Optional chaining keeps these safe to call outside Vite (node).
 function getProxyUrl() {
   return import.meta.env?.VITE_GEMINI_PROXY_URL ?? "";
 }
@@ -77,8 +74,7 @@ function buildPrompt(transcript, languageCode) {
   ].join("\n");
 }
 
-// Exported for the scratch self-check: turns a raw generateContent response
-// body into { revisedScript, changes } or throws.
+// Turns a raw generateContent response body into { revisedScript, changes } or throws.
 export function parseSuggestionResponse(responseBody) {
   const rawText = responseBody?.candidates?.[0]?.content?.parts?.[0]?.text;
 
@@ -107,14 +103,11 @@ export function parseSuggestionResponse(responseBody) {
   };
 }
 
-// Maps the corrections back onto the original timestamped entries so the
-// transcript keeps its exact format with corrections applied in place.
-// Returns one segment array per entry; segments carrying a change display
-// change.suggestion instead of what was said. Each change is matched
-// case-insensitively, consumed at most once across all entries, and
-// non-overlapping matches win by position. Changes whose original never
-// matches (e.g. it spans two entries) stay unhighlighted but still appear in
-// the change list.
+// Maps corrections onto the original timestamped entries: one segment array
+// per entry, segments with a change show the suggestion in place. Each change
+// matches case-insensitively and is consumed at most once; a change whose
+// original never matches (e.g. spans two entries) stays unhighlighted but
+// still appears in the change list.
 export function annotateTranscriptEntries(entries, changes) {
   const remaining = (changes ?? []).filter((change) => change.original);
 

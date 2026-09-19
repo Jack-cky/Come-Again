@@ -21,7 +21,7 @@ const MAX_PITCH_HZ = 400;
 // ambiguous to trust as a fundamental frequency, so the frame counts as
 // unvoiced rather than polluting the vocal-variety spread.
 const PITCH_CLARITY_THRESHOLD = 0.5;
-const SILENT_FRAME_RMS = 0.012;
+export const SILENT_FRAME_RMS = 0.012;
 const LONG_PAUSE_SECONDS = 2;
 const LONG_PAUSE_FRAMES = Math.round((LONG_PAUSE_SECONDS * 1000) / AUDIO_FRAME_INTERVAL_MS);
 const MIN_VOICED_FRAMES = 15;
@@ -217,6 +217,27 @@ function computePitchVarietySemitones(audioFrames, speechThreshold) {
 // Median gaze point of the take so far, or null while there are too few
 // samples to trust one. The median (not the mean) keeps a brief glance away
 // from dragging the anchor point with it.
+// Recognition emits its first interim result well after speech begins, so a
+// transcript entry stamped at that moment lands mid-sentence on replay. Walk
+// back from the frame at that moment to the first voiced frame after the
+// nearest run of silence — that is where the utterance actually started.
+export function findSpeechOnsetMs(audioFrames, atMs, notBeforeMs = 0) {
+  const silentRun = Math.round(300 / AUDIO_FRAME_INTERVAL_MS);
+  const floor = Math.floor(notBeforeMs / AUDIO_FRAME_INTERVAL_MS);
+  let index = Math.min(Math.floor(atMs / AUDIO_FRAME_INTERVAL_MS), audioFrames.length - 1);
+  let silentCount = 0;
+
+  for (; index > floor; index -= 1) {
+    silentCount = audioFrames[index].rms < SILENT_FRAME_RMS ? silentCount + 1 : 0;
+
+    if (silentCount >= silentRun) {
+      return (index + silentRun) * AUDIO_FRAME_INTERVAL_MS;
+    }
+  }
+
+  return Math.max(floor, 0) * AUDIO_FRAME_INTERVAL_MS;
+}
+
 export function computeGazeMedian(gazeSamples) {
   if (!gazeSamples || gazeSamples.length < MIN_GAZE_SAMPLES) {
     return null;

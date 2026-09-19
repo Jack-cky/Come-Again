@@ -230,9 +230,7 @@ export default function useSentencePractice(defaultLanguage) {
     if (sourceNodeRef.current) {
       try {
         sourceNodeRef.current.disconnect();
-      } catch {
-        // ignore
-      }
+      } catch {}
       sourceNodeRef.current = null;
     }
 
@@ -340,9 +338,7 @@ export default function useSentencePractice(defaultLanguage) {
       recorder.ondataavailable = null;
       recorder.onerror = null;
       recorder.onstop = null;
-    } catch {
-      // ignore
-    }
+    } catch {}
   }, []);
 
   const stopRecordingAndWait = useCallback(async () => {
@@ -600,9 +596,7 @@ export default function useSentencePractice(defaultLanguage) {
         oldRecognition.onend = null;
         oldRecognition.stop();
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
 
     const recognition = createConfiguredRecognition(recognitionClass);
     recognitionRef.current = recognition;

@@ -64,7 +64,7 @@ export function attachAiSummaryToTake(recordedAt, aiSummary) {
     entry.aiSummary = aiSummary;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(history));
   } catch {
-    // Storage may be full or blocked; take history is best-effort.
+    // Best-effort, as above.
   }
 }
 
@@ -77,6 +77,6 @@ export function saveTakeToHistory(summary, history = loadTakeHistory()) {
     const nextHistory = [...history, summary].slice(-MAX_STORED_TAKES);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(nextHistory));
   } catch {
-    // Storage may be full or blocked; take history is best-effort.
+    // Best-effort, as above.
   }
 }

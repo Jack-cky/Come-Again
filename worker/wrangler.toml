@@ -3,9 +3,5 @@ main = "gemini-proxy.js"
 compatibility_date = "2026-07-19"
 
 [vars]
-# Origins allowed to call this proxy. Replace YOUR-USERNAME with your GitHub
-# username (the origin is the github.io host only, no repository path).
-ALLOWED_ORIGINS = "http://localhost:5173,http://localhost:4173,https://jack-cky.github.io"
-# Gemini model the proxy calls. Change here (no site rebuild needed), then
-# `npx wrangler deploy`.
-GEMINI_MODEL = "gemini-2.5-flash"
+ALLOWED_ORIGINS = "http://localhost:5173,http://localhost:4173,http://localhost:8080,https://jack-cky.github.io"
+GEMINI_MODEL = "gemini-3-flash-preview"

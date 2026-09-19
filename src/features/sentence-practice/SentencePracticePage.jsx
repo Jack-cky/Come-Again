@@ -117,7 +117,6 @@ export default function SentencePracticePage() {
       setSelectedLanguage(handoff.languageCode);
     }
     // Mount-only by design: the handoff is a one-shot read.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const goToPart = (index) => {
@@ -215,7 +214,6 @@ export default function SentencePracticePage() {
   // recompute once the reading dictionary finishes loading.
   const transcriptMode = useMemo(
     () => resolveTranscriptMode(referenceText, finalTranscript, selectedLanguage),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [finalTranscript, referenceText, selectedLanguage, phoneticsStatus],
   );
 
@@ -225,7 +223,6 @@ export default function SentencePracticePage() {
         includeMissed: hasUserStopped && !isListening,
         mode: transcriptMode,
       }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       finalTranscript,
       hasUserStopped,
@@ -468,10 +465,18 @@ export default function SentencePracticePage() {
             id="reference-text"
             value={referenceText}
             onChange={(event) => {
-              setReferenceText(event.target.value);
+              const nextText = event.target.value;
+
+              setReferenceText(nextText);
               setReferenceSource(null);
-              setPracticeParts(null);
               setReferenceLoadState({ isLoading: false, loadingId: null, message: "" });
+
+              // Whilst drilling in parts, typing edits the current part only
+              // (e.g. fixing a wrong AI correction) and keeps the stepper.
+              if (practiceParts) {
+                const parts = practiceParts.parts.with(practiceParts.index, nextText);
+                setPracticeParts({ ...practiceParts, parts, fullText: parts.join(" ") });
+              }
             }}
             placeholder="Paste any text you want to practice, or use Quick load above. Your speech will be scored against whatever is written here."
           />
